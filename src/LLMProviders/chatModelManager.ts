@@ -1,0 +1,957 @@
+import { CustomModel, getModelKey, ModelConfig } from "@/aiParams";
+import {
+  BREVILABS_MODELS_BASE_URL,
+  BUILTIN_CHAT_MODELS,
+  ChatModelProviders,
+  DEFAULT_OLLAMA_NUM_CTX,
+  ModelCapability,
+  ProviderInfo,
+} from "@/constants";
+import { logError, logInfo, logWarn } from "@/logger";
+import { isPaidEnabled } from "@/plusUtils";
+import {
+  CopilotSettings,
+  getModelKeyFromModel,
+  getSettings,
+  subscribeToSettingsChange,
+} from "@/settings/model";
+import { findCustomModel, getModelInfo, ModelInfo, safeFetch } from "@/utils";
+import { googleHostBaseUrl, groqHostBaseUrl } from "@/utils/providerBaseUrl";
+import { ChatAnthropic } from "@langchain/anthropic";
+import { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { BaseLanguageModel } from "@langchain/core/language_models/base";
+import { ChatDeepSeek } from "@langchain/deepseek";
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { ChatGroq } from "@langchain/groq";
+import { ChatOllama } from "@langchain/ollama";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatXAI } from "@langchain/xai";
+import { MissingApiKeyError, MissingPlusLicenseError } from "@/error";
+import { ChatOpenRouter } from "./ChatOpenRouter";
+import { ChatLMStudio } from "./ChatLMStudio";
+import { BrevilabsClient } from "./brevilabsClient";
+import type { SafetySetting } from "@google/generative-ai";
+
+const GOOGLE_SAFETY_SETTINGS_BLOCK_NONE: SafetySetting[] = [
+  { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" } as SafetySetting,
+  { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" } as SafetySetting,
+  { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" } as SafetySetting,
+  { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" } as SafetySetting,
+];
+
+// Patch BaseLanguageModel.prototype.getNumTokens once at module load to prevent
+// tiktoken CDN fetches. LangChain's default getNumTokens() downloads a ~3MB BPE
+// vocabulary from tiktoken.pages.dev, which blocks all LLM calls when the CDN is
+// unreachable. This char/4 estimation is the same fallback LangChain uses internally
+// before tiktoken loads. Actual token usage comes from API response metadata.
+
+(
+  BaseLanguageModel.prototype as { getNumTokens: (...args: unknown[]) => Promise<number> }
+).getNumTokens = async (content: string | Array<{ type: string; text?: string }>) => {
+  const text =
+    typeof content === "string"
+      ? content
+      : content.map((item: { type: string; text?: string }): string => item.text ?? "").join("");
+  return Math.ceil(text.length / 4);
+};
+
+type ChatConstructorType = {
+  new (config: Record<string, unknown>): BaseChatModel;
+};
+
+const CHAT_PROVIDER_CONSTRUCTORS = {
+  [ChatModelProviders.OPENAI]: ChatOpenAI,
+  [ChatModelProviders.AZURE_OPENAI]: ChatOpenAI,
+  [ChatModelProviders.ANTHROPIC]: ChatAnthropic,
+  [ChatModelProviders.COHEREAI]: ChatOpenAI,
+  [ChatModelProviders.GOOGLE]: ChatGoogleGenerativeAI,
+  [ChatModelProviders.XAI]: ChatXAI,
+  [ChatModelProviders.OPENROUTERAI]: ChatOpenRouter,
+  [ChatModelProviders.OLLAMA]: ChatOllama,
+  [ChatModelProviders.LM_STUDIO]: ChatOpenRouter,
+  [ChatModelProviders.GROQ]: ChatGroq,
+  [ChatModelProviders.OPENAI_FORMAT]: ChatOpenAI,
+  [ChatModelProviders.SILICONFLOW]: ChatOpenAI,
+  [ChatModelProviders.COPILOT_PLUS]: ChatOpenRouter,
+  [ChatModelProviders.MISTRAL]: ChatOpenAI,
+  [ChatModelProviders.DEEPSEEK]: ChatDeepSeek,
+} as const;
+
+type ChatProviderConstructMap = typeof CHAT_PROVIDER_CONSTRUCTORS;
+
+/**
+ * Normalize an Azure URL that a user may have pasted in full.
+ * Strips trailing `/chat/completions` or `/embeddings` and extracts
+ * `api-version` from query parameters so the OpenAI client can
+ * construct the correct final URL.
+ */
+export function normalizeAzureUrl(raw: string | undefined): {
+  baseUrl: string | undefined;
+  apiVersion: string | undefined;
+} {
+  if (!raw) return { baseUrl: undefined, apiVersion: undefined };
+
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return { baseUrl: raw, apiVersion: undefined };
+  }
+
+  const apiVersion = url.searchParams.get("api-version") || undefined;
+  url.search = "";
+  let baseUrl = url.toString().replace(/\/+$/, "");
+
+  // Strip paths that the OpenAI client appends automatically
+  baseUrl = baseUrl.replace(/\/(chat\/completions|embeddings)$/, "");
+
+  return { baseUrl, apiVersion };
+}
+
+export default class ChatModelManager {
+  private static instance: ChatModelManager;
+  private static chatModel: BaseChatModel | null;
+  private static activeModel: CustomModel | null = null;
+  private static activeModelSource: "legacy" | "bridged" | null = null;
+  private static modelMap: Record<
+    string,
+    {
+      hasApiKey: boolean;
+      AIConstructor: ChatConstructorType;
+      vendor: string;
+    }
+  >;
+
+  private static readonly ANTHROPIC_THINKING_BUDGET_TOKENS = 2048;
+
+  private readonly providerApiKeyMap: Record<ChatModelProviders, () => string> = {
+    [ChatModelProviders.OPENAI]: () => getSettings().openAIApiKey,
+    [ChatModelProviders.GOOGLE]: () => getSettings().googleApiKey,
+    [ChatModelProviders.AZURE_OPENAI]: () => getSettings().azureOpenAIApiKey,
+    [ChatModelProviders.ANTHROPIC]: () => getSettings().anthropicApiKey,
+    [ChatModelProviders.COHEREAI]: () => getSettings().cohereApiKey,
+    [ChatModelProviders.OPENROUTERAI]: () => getSettings().openRouterAiApiKey,
+    [ChatModelProviders.GROQ]: () => getSettings().groqApiKey,
+    [ChatModelProviders.XAI]: () => getSettings().xaiApiKey,
+    [ChatModelProviders.OLLAMA]: () => "default-key",
+    [ChatModelProviders.LM_STUDIO]: () => "default-key",
+    [ChatModelProviders.OPENAI_FORMAT]: () => "default-key",
+    [ChatModelProviders.COPILOT_PLUS]: () => getSettings().plusLicenseKey,
+    [ChatModelProviders.MISTRAL]: () => getSettings().mistralApiKey,
+    [ChatModelProviders.DEEPSEEK]: () => getSettings().deepseekApiKey,
+    [ChatModelProviders.SILICONFLOW]: () => getSettings().siliconflowApiKey,
+  } as const;
+
+  private constructor() {
+    this.buildModelMap();
+    subscribeToSettingsChange(() => {
+      this.buildModelMap();
+      this.validateCurrentModel();
+    });
+  }
+
+  static getInstance(): ChatModelManager {
+    if (!ChatModelManager.instance) {
+      ChatModelManager.instance = new ChatModelManager();
+    }
+    return ChatModelManager.instance;
+  }
+
+  private static readonly REASONING_MODEL_TEMPERATURE = 1;
+
+  /**
+   * Determines the appropriate temperature for a model
+   * @returns temperature value or undefined if temperature should not be set
+   */
+  private getTemperatureForModel(
+    modelInfo: ModelInfo,
+    customModel: CustomModel,
+    settings: CopilotSettings
+  ): number | undefined {
+    // Thinking-enabled models don't accept temperature
+    if (modelInfo.isThinkingEnabled) {
+      return undefined;
+    }
+
+    // O-series and GPT-5 models require temperature = 1
+    if (modelInfo.isOSeries || modelInfo.isGPT5) {
+      return ChatModelManager.REASONING_MODEL_TEMPERATURE;
+    }
+
+    // All other models use configured temperature
+    return customModel.temperature ?? settings.temperature;
+  }
+
+  private async getModelConfig(
+    customModel: CustomModel,
+    allowLegacyCredentialFallback: boolean = true
+  ): Promise<ModelConfig> {
+    const settings = getSettings();
+
+    const modelName = customModel.name;
+    const modelInfo = getModelInfo(modelName);
+    const { isThinkingEnabled, usesAdaptiveThinking } = modelInfo;
+    const resolvedTemperature = this.getTemperatureForModel(modelInfo, customModel, settings);
+    // Copilot sets no output limit. This stays undefined unless the model
+    // carries one of its own, and an undefined limit is left out of the
+    // request, so the provider writes whatever the context window allows.
+    // https://github.com/logancyang/obsidian-copilot-preview/issues/312
+    const maxTokens = customModel.maxTokens;
+    const openAIFormatIsKeyless = customModel.requiresApiKey === false;
+
+    // Base config - temperature will be handled by provider-specific methods
+    const baseConfig: Omit<ModelConfig, "maxTokens" | "maxCompletionTokens"> = {
+      modelName: modelName,
+      streaming: customModel.stream ?? true,
+      maxRetries: 3,
+      maxConcurrency: 3,
+      enableCors: customModel.enableCors,
+      // Add temperature for normal models (will be overridden by special configs if needed)
+      ...(!isThinkingEnabled && resolvedTemperature !== undefined
+        ? { temperature: resolvedTemperature }
+        : {}),
+    };
+
+    const providerConfig: {
+      [K in keyof ChatProviderConstructMap]: ConstructorParameters<ChatProviderConstructMap[K]>[0];
+    } = {
+      [ChatModelProviders.OPENAI]: {
+        modelName: modelName,
+        apiKey: await this.resolveApiKey(
+          customModel.apiKey,
+          settings.openAIApiKey,
+          allowLegacyCredentialFallback
+        ),
+        configuration: {
+          baseURL: customModel.baseUrl,
+          fetch: customModel.enableCors ? safeFetch : undefined,
+          organization: customModel.openAIOrgId || settings.openAIOrgId,
+        },
+        ...this.getOpenAISpecialConfig(modelName, maxTokens, customModel),
+      },
+      [ChatModelProviders.ANTHROPIC]: {
+        anthropicApiKey: await this.resolveApiKey(
+          customModel.apiKey,
+          settings.anthropicApiKey,
+          allowLegacyCredentialFallback
+        ),
+        model: modelName,
+        anthropicApiUrl: customModel.baseUrl,
+        clientOptions: {
+          // Required to bypass CORS restrictions
+          defaultHeaders: {
+            "anthropic-dangerous-direct-browser-access": "true",
+          },
+          fetch: customModel.enableCors ? safeFetch : undefined,
+        },
+        ...(isThinkingEnabled && {
+          // Opus 4.7+ defaults thinking.display to "omitted" so thinking summaries
+          // never reach the UI; force "summarized" for the adaptive branch. Pre-4.7
+          // models default to "summarized" server-side and don't need this.
+          thinking: usesAdaptiveThinking
+            ? { type: "adaptive" as const, display: "summarized" as const }
+            : {
+                type: "enabled" as const,
+                budget_tokens: ChatModelManager.ANTHROPIC_THINKING_BUDGET_TOKENS,
+              },
+        }),
+      },
+      [ChatModelProviders.AZURE_OPENAI]: await (async (): Promise<Record<string, unknown>> => {
+        const azureUrl = normalizeAzureUrl(customModel.baseUrl);
+        return {
+          modelName: customModel.baseUrl
+            ? modelName
+            : customModel.azureOpenAIApiDeploymentName || settings.azureOpenAIApiDeploymentName,
+          apiKey: await this.resolveApiKey(
+            customModel.apiKey,
+            settings.azureOpenAIApiKey,
+            allowLegacyCredentialFallback
+          ),
+          configuration: {
+            baseURL:
+              azureUrl.baseUrl ||
+              `https://${customModel.azureOpenAIApiInstanceName || settings.azureOpenAIApiInstanceName}.openai.azure.com/openai/deployments/${customModel.azureOpenAIApiDeploymentName || settings.azureOpenAIApiDeploymentName}`,
+            defaultQuery: {
+              "api-version":
+                azureUrl.apiVersion ||
+                customModel.azureOpenAIApiVersion ||
+                settings.azureOpenAIApiVersion ||
+                "2024-05-01-preview",
+            },
+            defaultHeaders: {
+              "Content-Type": "application/json",
+              "api-key": await this.resolveApiKey(
+                customModel.apiKey,
+                settings.azureOpenAIApiKey,
+                allowLegacyCredentialFallback
+              ),
+            },
+            fetch: customModel.enableCors ? safeFetch : undefined,
+          },
+          ...this.getOpenAISpecialConfig(modelName, maxTokens, customModel),
+        };
+      })(),
+      [ChatModelProviders.COHEREAI]: {
+        modelName,
+        apiKey: await this.resolveApiKey(
+          customModel.apiKey,
+          settings.cohereApiKey,
+          allowLegacyCredentialFallback
+        ),
+        configuration: {
+          baseURL: customModel.baseUrl || ProviderInfo[ChatModelProviders.COHEREAI].host,
+          fetch: customModel.enableCors ? safeFetch : undefined,
+        },
+      },
+      [ChatModelProviders.GOOGLE]: {
+        apiKey: await this.resolveApiKey(
+          customModel.apiKey,
+          settings.googleApiKey,
+          allowLegacyCredentialFallback
+        ),
+        model: modelName,
+        safetySettings: GOOGLE_SAFETY_SETTINGS_BLOCK_NONE,
+        // ChatGoogleGenerativeAI appends `/v1beta` itself; a stored versioned
+        // base URL would double the segment (`/v1beta/v1beta/…` → 404).
+        baseUrl: googleHostBaseUrl(customModel.baseUrl),
+      },
+      [ChatModelProviders.XAI]: {
+        apiKey: await this.resolveApiKey(
+          customModel.apiKey,
+          settings.xaiApiKey,
+          allowLegacyCredentialFallback
+        ),
+        model: modelName,
+        // This langchainjs XAI client does not support baseURL override
+      },
+      [ChatModelProviders.OPENROUTERAI]: {
+        modelName: modelName,
+        apiKey: await this.resolveApiKey(
+          customModel.apiKey,
+          settings.openRouterAiApiKey,
+          allowLegacyCredentialFallback
+        ),
+        configuration: {
+          baseURL: customModel.baseUrl || "https://openrouter.ai/api/v1",
+          fetch: customModel.enableCors ? safeFetch : undefined,
+          defaultHeaders: {
+            "HTTP-Referer": "https://obsidiancopilot.com",
+            "X-Title": "Obsidian Copilot",
+          },
+        },
+        // Enable reasoning if the model has the reasoning capability
+        enableReasoning: customModel.capabilities?.includes(ModelCapability.REASONING) ?? false,
+        // Pass reasoning effort if configured and reasoning capability is enabled
+        reasoningEffort:
+          customModel.capabilities?.includes(ModelCapability.REASONING) &&
+          customModel.reasoningEffort
+            ? customModel.reasoningEffort
+            : undefined,
+        // Enable prompt caching by default; can be turned off for ZDR endpoints
+        enablePromptCaching: customModel.enablePromptCaching ?? true,
+      },
+      [ChatModelProviders.GROQ]: {
+        apiKey: await this.resolveApiKey(
+          customModel.apiKey,
+          settings.groqApiKey,
+          allowLegacyCredentialFallback
+        ),
+        model: modelName,
+        // groq-sdk appends `/openai/v1` itself; the stored URL is usually the
+        // versioned models.dev form, which would double the segment.
+        baseUrl: groqHostBaseUrl(customModel.baseUrl),
+      },
+      [ChatModelProviders.OLLAMA]: {
+        // ChatOllama has `model` instead of `modelName`!!
+        model: modelName,
+        // MUST NOT use /v1 in the baseUrl for ollama
+        baseUrl: customModel.baseUrl || "http://localhost:11434",
+        headers: {
+          Authorization: `Bearer ${customModel.apiKey || "default-key"}`,
+        },
+        // Route through Obsidian's requestUrl (safeFetch) to bypass CORS / mixed-content
+        // restrictions — required on mobile (WKWebView) when calling http:// Ollama hosts.
+        fetch: customModel.enableCors ? safeFetch : undefined,
+        // Enable thinking for models with REASONING capability (e.g., qwen3, deepseek-r1)
+        // Thinking content goes to additional_kwargs.reasoning_content
+        think: customModel.capabilities?.includes(ModelCapability.REASONING) ?? false,
+        // Reduce repetition in local models (1.1 = slight penalty, helps with hallucination loops)
+        repeatPenalty: 1.1,
+        numCtx: customModel.numCtx ?? DEFAULT_OLLAMA_NUM_CTX,
+      },
+      [ChatModelProviders.LM_STUDIO]: {
+        modelName: modelName,
+        apiKey: customModel.apiKey || "default-key",
+        streamUsage: customModel.streamUsage ?? false,
+        configuration: {
+          baseURL: customModel.baseUrl || "http://localhost:1234/v1",
+          fetch: customModel.enableCors ? safeFetch : undefined,
+        },
+        // Enable reasoning extraction for models with REASONING capability
+        enableReasoning: customModel.capabilities?.includes(ModelCapability.REASONING) ?? false,
+        // Pass reasoning effort if configured and reasoning capability is enabled
+        reasoningEffort:
+          customModel.capabilities?.includes(ModelCapability.REASONING) &&
+          customModel.reasoningEffort
+            ? customModel.reasoningEffort
+            : undefined,
+      },
+      [ChatModelProviders.OPENAI_FORMAT]: {
+        modelName: modelName,
+        apiKey: openAIFormatIsKeyless
+          ? undefined
+          : await this.resolveApiKey(
+              customModel.apiKey,
+              settings.openAIApiKey,
+              allowLegacyCredentialFallback
+            ),
+        streamUsage: customModel.streamUsage ?? false,
+        configuration: {
+          baseURL: customModel.baseUrl,
+          fetch: customModel.enableCors ? safeFetch : undefined,
+          // The OpenAI SDK accepts an explicit null to omit its default auth
+          // header while still constructing a client for a keyless endpoint.
+          // https://github.com/logancyang/obsidian-copilot/issues/2895
+          defaultHeaders: openAIFormatIsKeyless ? { Authorization: null } : undefined,
+        },
+        ...this.getOpenAISpecialConfig(modelName, maxTokens, customModel),
+      },
+      [ChatModelProviders.SILICONFLOW]: {
+        modelName: modelName,
+        apiKey: await this.resolveApiKey(
+          customModel.apiKey,
+          settings.siliconflowApiKey,
+          allowLegacyCredentialFallback
+        ),
+        configuration: {
+          baseURL: customModel.baseUrl || ProviderInfo[ChatModelProviders.SILICONFLOW].host,
+          fetch: customModel.enableCors ? safeFetch : undefined,
+        },
+        ...this.getOpenAISpecialConfig(modelName, maxTokens, customModel),
+      },
+      [ChatModelProviders.COPILOT_PLUS]: {
+        modelName: modelName,
+        apiKey: await this.resolveApiKey(
+          customModel.apiKey,
+          settings.plusLicenseKey,
+          allowLegacyCredentialFallback
+        ),
+        configuration: {
+          baseURL: BREVILABS_MODELS_BASE_URL,
+          fetch: safeFetch,
+          defaultHeaders: BrevilabsClient.getInstance().getPluginVersionHeaders(),
+        },
+        // Reasoning is opt-in: forward the user's per-model effort pick only for
+        // REASONING-capable models, and gate enableReasoning on an EXPLICIT effort.
+        // Without an effort, ChatOpenRouter.invocationParams falls back to
+        // `reasoning: { max_tokens: 1024 }`, which would make the default-on
+        // copilot-plus-flash spend reasoning budget/latency despite being the fast
+        // default. So flash stays fast until the user picks an effort.
+        enableReasoning:
+          (customModel.capabilities?.includes(ModelCapability.REASONING) ?? false) &&
+          !!customModel.reasoningEffort,
+        reasoningEffort:
+          customModel.capabilities?.includes(ModelCapability.REASONING) &&
+          customModel.reasoningEffort
+            ? customModel.reasoningEffort
+            : undefined,
+      },
+      [ChatModelProviders.MISTRAL]: {
+        modelName,
+        apiKey: await this.resolveApiKey(
+          customModel.apiKey,
+          settings.mistralApiKey,
+          allowLegacyCredentialFallback
+        ),
+        configuration: {
+          baseURL: customModel.baseUrl || ProviderInfo[ChatModelProviders.MISTRAL].host,
+          fetch: customModel.enableCors ? safeFetch : undefined,
+        },
+      },
+      [ChatModelProviders.DEEPSEEK]: {
+        modelName: modelName,
+        apiKey: await this.resolveApiKey(
+          customModel.apiKey,
+          settings.deepseekApiKey,
+          allowLegacyCredentialFallback
+        ),
+        configuration: {
+          baseURL: customModel.baseUrl || ProviderInfo[ChatModelProviders.DEEPSEEK].host,
+          fetch: customModel.enableCors ? safeFetch : undefined,
+        },
+      },
+    };
+
+    const selectedProviderConfig =
+      providerConfig[customModel.provider as keyof typeof providerConfig] || {};
+
+    // Get provider-specific parameters (like topP, frequencyPenalty) that the provider supports
+    const providerSpecificParams = this.getProviderSpecificParams(
+      customModel.provider as ChatModelProviders,
+      customModel
+    );
+
+    const finalConfig = {
+      ...baseConfig,
+      ...selectedProviderConfig,
+      ...providerSpecificParams,
+      ...(maxTokens === undefined ? {} : { maxTokens }),
+    };
+
+    return finalConfig as ModelConfig;
+  }
+
+  private async resolveApiKey(
+    modelApiKey: string | undefined,
+    legacyApiKey: string,
+    allowLegacyCredentialFallback: boolean
+  ): Promise<string> {
+    return modelApiKey || (allowLegacyCredentialFallback ? legacyApiKey : "");
+  }
+
+  /**
+   * Adds special configuration for OpenAI models that support reasoning
+   * LangChain 0.6.6+ handles most of the token/temperature logic internally
+   *
+   * NOTE: GPT-5 models require Responses API for verbosity parameter to work.
+   * The useResponsesApi flag is set automatically in createModelInstance() for GPT-5.
+   */
+  private getOpenAISpecialConfig(
+    modelName: string,
+    maxTokens: number | undefined,
+    customModel?: CustomModel
+  ): Record<string, unknown> {
+    const settings = getSettings();
+    const modelInfo = getModelInfo(modelName);
+    const resolvedTemperature = this.getTemperatureForModel(
+      modelInfo,
+      customModel || ({} as CustomModel),
+      settings
+    );
+
+    const config: Record<string, unknown> = {
+      temperature: resolvedTemperature,
+      ...(maxTokens === undefined ? {} : { maxTokens }),
+    };
+
+    // Add reasoning parameters for O-series and GPT-5 models
+    // LangChain 0.6.6 will handle the endpoint routing and parameter conversion
+    if ((modelInfo.isOSeries || modelInfo.isGPT5) && customModel?.reasoningEffort) {
+      config.reasoning = {
+        effort: customModel.reasoningEffort,
+      };
+
+      // Add verbosity for GPT-5 models (Responses API only).
+      // Azure does not support Responses API so skip verbosity there;
+      // useResponsesApi is only enabled for OPENAI / OPENAI_FORMAT in createModelInstance().
+      if (
+        modelInfo.isGPT5 &&
+        customModel?.verbosity &&
+        (customModel?.provider as ChatModelProviders) !== ChatModelProviders.AZURE_OPENAI
+      ) {
+        const verbosityValue = customModel.verbosity;
+        // For Responses API, verbosity is nested under 'text' parameter
+        config.text = {
+          verbosity: verbosityValue,
+        };
+      }
+    }
+
+    return config;
+  }
+
+  /**
+   * Returns provider-specific parameters (like topP, frequencyPenalty) based on what the provider supports
+   * This prevents passing undefined values to providers that don't support them
+   */
+  private getProviderSpecificParams(provider: ChatModelProviders, customModel: CustomModel) {
+    const params: Record<string, unknown> = {};
+
+    // Add topP only if defined
+    if (customModel.topP !== undefined) {
+      // These providers support topP
+      if (
+        [
+          ChatModelProviders.OPENAI,
+          ChatModelProviders.AZURE_OPENAI,
+          ChatModelProviders.ANTHROPIC,
+          ChatModelProviders.GOOGLE,
+          ChatModelProviders.OPENROUTERAI,
+          ChatModelProviders.OLLAMA,
+          ChatModelProviders.LM_STUDIO,
+          ChatModelProviders.OPENAI_FORMAT,
+          ChatModelProviders.MISTRAL,
+          ChatModelProviders.DEEPSEEK,
+          ChatModelProviders.SILICONFLOW,
+        ].includes(provider)
+      ) {
+        params.topP = customModel.topP;
+      }
+    }
+
+    // Add frequencyPenalty only if defined
+    if (customModel.frequencyPenalty !== undefined) {
+      // These providers support frequencyPenalty
+      if (
+        [
+          ChatModelProviders.OPENAI,
+          ChatModelProviders.AZURE_OPENAI,
+          ChatModelProviders.OPENROUTERAI,
+          ChatModelProviders.OLLAMA,
+          ChatModelProviders.LM_STUDIO,
+          ChatModelProviders.OPENAI_FORMAT,
+          ChatModelProviders.MISTRAL,
+          ChatModelProviders.DEEPSEEK,
+          ChatModelProviders.SILICONFLOW,
+        ].includes(provider)
+      ) {
+        params.frequencyPenalty = customModel.frequencyPenalty;
+      }
+    }
+
+    return params;
+  }
+
+  // Build a map of modelKey to model config
+  public buildModelMap() {
+    const activeModels = getSettings().activeModels;
+    ChatModelManager.modelMap = {};
+    const modelMap = ChatModelManager.modelMap;
+
+    const allModels = activeModels ?? BUILTIN_CHAT_MODELS;
+
+    allModels.forEach((model) => {
+      if (model.enabled) {
+        if (!Object.values(ChatModelProviders).includes(model.provider as ChatModelProviders)) {
+          logWarn(`Unknown provider: ${model.provider} for model: ${model.name}`);
+          return;
+        }
+
+        const constructor = this.getProviderConstructor(model);
+        const hasCredentials = this.hasProviderCredentials(model);
+        const modelKey = getModelKeyFromModel(model);
+        modelMap[modelKey] = {
+          hasApiKey: hasCredentials,
+          AIConstructor: constructor,
+          vendor: model.provider,
+        };
+      }
+    });
+  }
+
+  /**
+   * Checks if a model has the necessary credentials configured for its provider.
+   * @param model - The custom model definition.
+   * @returns True when the provider requirements are satisfied, otherwise false.
+   */
+  private hasProviderCredentials(
+    model: CustomModel,
+    allowLegacyCredentialFallback: boolean = true
+  ): boolean {
+    if (
+      model.requiresApiKey === false &&
+      (model.provider as ChatModelProviders) === ChatModelProviders.OPENAI_FORMAT
+    ) {
+      return true;
+    }
+
+    const getDefaultApiKey = this.providerApiKeyMap[model.provider as ChatModelProviders];
+    if (!getDefaultApiKey) {
+      return Boolean(model.apiKey);
+    }
+
+    return Boolean(model.apiKey || (allowLegacyCredentialFallback ? getDefaultApiKey() : ""));
+  }
+
+  getProviderConstructor(model: CustomModel): ChatConstructorType {
+    const constructor: ChatConstructorType = CHAT_PROVIDER_CONSTRUCTORS[
+      model.provider as ChatModelProviders
+    ] as unknown as ChatConstructorType;
+    if (!constructor) {
+      logWarn(`Unknown provider: ${model.provider} for model: ${model.name}`);
+      throw new Error(`Unknown provider: ${model.provider} for model: ${model.name}`);
+    }
+    return constructor;
+  }
+
+  getChatModel(): BaseChatModel {
+    if (!ChatModelManager.chatModel) {
+      throw new Error("No valid chat model available. Please check your API key settings.");
+    }
+    return ChatModelManager.chatModel;
+  }
+
+  getActiveModel(): CustomModel | null {
+    return ChatModelManager.activeModel;
+  }
+
+  /**
+   * Helper to validate a model config has valid credentials and meets entitlement requirements.
+   * Does NOT check believerExclusive - that's validated at usage time, not selection time.
+   */
+  private isModelConfigValid(model: CustomModel, settings: CopilotSettings): boolean {
+    const modelKey = getModelKeyFromModel(model);
+    const modelInfo = ChatModelManager.modelMap[modelKey];
+
+    // Check if model exists in map and has API key
+    if (!modelInfo || !modelInfo.hasApiKey) {
+      return false;
+    }
+
+    // Check Copilot Plus entitlement requirements (bypassed in self-host mode)
+    if (model.plusExclusive && !isPaidEnabled()) {
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Resolves the active chat model for temperature override operations.
+   * Uses a single source of truth: getModelKey() -> findCustomModel()
+   * Falls back to first valid model in settings.activeModels if current selection is invalid.
+   *
+   * Note: believerExclusive models are trusted if explicitly selected by the user,
+   * but skipped in fallback to avoid selecting them for non-Believer users.
+   */
+  private resolveModelForTemperatureOverride(): CustomModel {
+    const settings = getSettings();
+
+    // Try to get the user's currently selected model
+    try {
+      const currentModelKey = getModelKey();
+      if (currentModelKey) {
+        const model = findCustomModel(currentModelKey, settings.activeModels);
+
+        // Validate it (trust believerExclusive if user selected it)
+        if (this.isModelConfigValid(model, settings)) {
+          return model;
+        }
+      }
+    } catch {
+      // Model not found or invalid, fall through to fallback
+    }
+
+    // Fallback: Find first valid model in settings.activeModels
+    // Skip believerExclusive models in fallback to avoid selecting them for non-Believer users
+    for (const model of settings.activeModels) {
+      if (model.enabled && !model.believerExclusive && this.isModelConfigValid(model, settings)) {
+        return model;
+      }
+    }
+
+    // No valid model found
+    throw new Error(
+      "No valid chat model available for temperature override. " +
+        "Please check your API key settings and ensure at least one model is properly configured."
+    );
+  }
+
+  /**
+   * langchain 1.0 TypeScript doesn't support temperature override in BaseChatModelCallOptions,
+   * so we need to create a new model instance with the specified temperature.
+   */
+  async getChatModelWithTemperature(temperature: number): Promise<BaseChatModel> {
+    const modelConfig = ChatModelManager.activeModel ?? this.resolveModelForTemperatureOverride();
+
+    // Create a temporary model config with overridden temperature
+    const modelWithTempOverride: CustomModel = {
+      ...modelConfig,
+      temperature,
+    };
+
+    return ChatModelManager.activeModelSource === "bridged"
+      ? await this.createModelInstanceFromBridged(modelWithTempOverride)
+      : await this.createModelInstance(modelWithTempOverride);
+  }
+
+  async setChatModel(model: CustomModel): Promise<void> {
+    try {
+      const modelInstance = await this.createModelInstance(model);
+      ChatModelManager.chatModel = modelInstance;
+      ChatModelManager.activeModel = model;
+      ChatModelManager.activeModelSource = "legacy";
+
+      // Log if Responses API is enabled for GPT-5
+      const modelInfo = getModelInfo(model.name);
+      if (
+        modelInfo.isGPT5 &&
+        ((model.provider as ChatModelProviders) === ChatModelProviders.OPENAI ||
+          (model.provider as ChatModelProviders) === ChatModelProviders.OPENAI_FORMAT)
+      ) {
+        logInfo(`Chat model set with Responses API for GPT-5: ${model.name}`);
+      }
+    } catch (error) {
+      logError(error);
+      throw error;
+    }
+  }
+
+  /**
+   * Set the active chat model from a chat-backend `CustomModel` produced by the
+   * bridge. Counterpart to `setChatModel` that goes through
+   * `createModelInstanceFromBridged` (no `activeModels` modelMap gate).
+   */
+  async setChatModelFromBridged(model: CustomModel): Promise<void> {
+    try {
+      ChatModelManager.chatModel = await this.createModelInstanceFromBridged(model);
+      ChatModelManager.activeModel = model;
+      ChatModelManager.activeModelSource = "bridged";
+    } catch (error) {
+      logError(error);
+      throw error;
+    }
+  }
+
+  async createModelInstance(model: CustomModel): Promise<BaseChatModel> {
+    // Create and return the appropriate model
+    const modelKey = getModelKeyFromModel(model);
+    const selectedModel = ChatModelManager.modelMap[modelKey];
+    if (!selectedModel) {
+      throw new Error(`No model found for: ${modelKey}`);
+    }
+    if (!selectedModel.hasApiKey) {
+      const errorMessage = `API key is not provided for the model: ${modelKey}.`;
+      if ((model.provider as ChatModelProviders) === ChatModelProviders.COPILOT_PLUS) {
+        throw new MissingPlusLicenseError(
+          "Copilot Plus license key is not configured. Please enter your license key in the Copilot Plus section at the top of Basic Settings."
+        );
+      }
+      throw new MissingApiKeyError(errorMessage);
+    }
+
+    return this.instantiateChatModel(
+      model,
+      selectedModel.vendor as ChatModelProviders,
+      selectedModel.AIConstructor
+    );
+  }
+
+  /**
+   * Build a chat model from a `CustomModel` produced by the model-management
+   * "chat" backend bridge (`configuredModelToCustomModel`). Unlike
+   * `createModelInstance`, this does NOT consult `modelMap` — that map is built
+   * from the legacy `settings.activeModels`, whereas chat-backend models live
+   * in the `Provider` / `ConfiguredModel` registries, so the `activeModels`
+   * gate would reject every bridged model. The bridge already resolved the
+   * provider + key, so credentials are validated directly off the model here.
+   */
+  async createModelInstanceFromBridged(model: CustomModel): Promise<BaseChatModel> {
+    if (!this.hasProviderCredentials(model, false)) {
+      if ((model.provider as ChatModelProviders) === ChatModelProviders.COPILOT_PLUS) {
+        throw new MissingPlusLicenseError(
+          "Copilot Plus license key is not configured. Please enter your license key in the Copilot Plus section at the top of Basic Settings."
+        );
+      }
+      throw new MissingApiKeyError(`API key is not provided for the model: ${model.name}.`);
+    }
+
+    return this.instantiateChatModel(
+      model,
+      model.provider as ChatModelProviders,
+      this.getProviderConstructor(model),
+      false
+    );
+  }
+
+  /**
+   * Shared construction path for both `createModelInstance` (legacy
+   * activeModels) and `createModelInstanceFromBridged` (chat backend). Builds
+   * the provider config, applies the GPT-5 / GitHub-Copilot Responses-API and
+   * LM Studio special cases, and constructs the LangChain client.
+   */
+  private async instantiateChatModel(
+    model: CustomModel,
+    vendor: ChatModelProviders,
+    AIConstructor: ChatConstructorType,
+    allowLegacyCredentialFallback: boolean = true
+  ): Promise<BaseChatModel> {
+    const modelConfig = await this.getModelConfig(model, allowLegacyCredentialFallback);
+    const modelInfo = getModelInfo(model.name);
+
+    // For GPT-5 models, automatically use Responses API for proper verbosity support
+    const constructorConfig: Record<string, unknown> = { ...modelConfig };
+    if (
+      modelInfo.isGPT5 &&
+      (vendor === ChatModelProviders.OPENAI || vendor === ChatModelProviders.OPENAI_FORMAT)
+    ) {
+      constructorConfig.useResponsesApi = true;
+      logInfo(`Enabling Responses API for GPT-5 model: ${model.name} (${vendor})`);
+    }
+
+    // For LM Studio, use ChatLMStudio by default for Responses API compatibility.
+    // Opt out by setting useResponsesApi to false.
+    if (
+      (model.provider as ChatModelProviders) === ChatModelProviders.LM_STUDIO &&
+      model.useResponsesApi !== false
+    ) {
+      const lmStudioInstance = new ChatLMStudio(constructorConfig);
+      logInfo(`[ChatModelManager] Using Responses API for LM Studio model: ${model.name}`);
+      return lmStudioInstance;
+    }
+
+    return new AIConstructor(constructorConfig);
+  }
+
+  validateChatModel(chatModel: BaseChatModel): boolean {
+    if (chatModel === undefined || chatModel === null) {
+      return false;
+    }
+    return true;
+  }
+
+  // Custom token estimation function for fallback when model is unknown
+  private estimateTokens(text: string): number {
+    if (!text) return 0;
+    // This is a simple approximation: ~4 chars per token for English text
+    // More accurate than using word count, but still a decent estimation
+    return Math.ceil(text.length / 4);
+  }
+
+  async countTokens(inputStr: string): Promise<number> {
+    return ChatModelManager.chatModel?.getNumTokens(inputStr) ?? this.estimateTokens(inputStr);
+  }
+
+  private validateCurrentModel(): void {
+    if (!ChatModelManager.chatModel) return;
+
+    const currentModelKey = getModelKey();
+    if (!currentModelKey) return;
+
+    // Get the model configuration
+    const selectedModel = ChatModelManager.modelMap[currentModelKey];
+
+    // Only invalidate keys the legacy modelMap actually knows about. A chat-
+    // backend selection is a `configuredModelId` that never appears in the
+    // activeModels-derived map; its validity is owned by chainManager's
+    // resolver, so an absent entry here must NOT clear the bridged model.
+    if (selectedModel && !selectedModel.hasApiKey) {
+      // Clear the current chat model
+      ChatModelManager.chatModel = null;
+      ChatModelManager.activeModel = null;
+      ChatModelManager.activeModelSource = null;
+      logInfo("Failed to reinitialize model due to missing API key");
+    }
+  }
+
+  findModelByName(modelName: string): CustomModel | undefined {
+    // Prefer the active bridged model on an exact name match, BEFORE the legacy
+    // lookup. Chat-backend (bridged) models live in the Provider/ConfiguredModel
+    // registries and carry the full capability set derived from their
+    // modalities/reasoning (`configuredModelToCustomModel`). A model whose wire id
+    // ALSO exists in legacy `settings.activeModels` — notably `copilot-plus-flash`,
+    // whose built-in entry advertises only VISION — would otherwise mask the
+    // bridged REASONING/VISION capabilities, so a capability check
+    // (CopilotPlusChainRunner.hasCapability / isMultimodalModel) reads `false` and
+    // reasoning/image content is dropped. The bridged model is the one actually
+    // running, so it wins.
+    if (
+      ChatModelManager.activeModelSource === "bridged" &&
+      ChatModelManager.activeModel?.name === modelName
+    ) {
+      return ChatModelManager.activeModel;
+    }
+    const settings = getSettings();
+    return settings.activeModels.find((model) => model.name === modelName);
+  }
+}

@@ -1,0 +1,239 @@
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
+import { TFile } from "obsidian";
+import { useApp } from "@/context";
+import { TypeaheadMenuPortal } from "@/components/chat-components/TypeaheadMenuPortal";
+import { useTypeaheadPlugin } from "@/components/chat-components/hooks/useTypeaheadPlugin";
+import {
+  $replaceTriggeredTextWithPill,
+  PillData,
+} from "@/components/chat-components/utils/lexicalTextUtils";
+import {
+  useAtMentionCategories,
+  AgentMentionBrand,
+  AtMentionCategory,
+  AtMentionOption,
+  CategoryOption,
+  EMPTY_AGENT_MENTION_BRANDS,
+} from "@/components/chat-components/hooks/useAtMentionCategories";
+import { useAtMentionSearch } from "@/components/chat-components/hooks/useAtMentionSearch";
+
+interface AtMentionCommandPluginProps {
+  isCopilotPlus?: boolean;
+  /** Whether to surface Copilot built-in `@` tools (category + search hits). */
+  showTools?: boolean;
+  currentActiveFile?: TFile | null;
+  /**
+   * Installed coding agents mentionable in this composer. Non-empty only in
+   * Agent Mode; surfaces the "Agents" typeahead group and inserts agent pills.
+   */
+  agentBrands?: ReadonlyArray<AgentMentionBrand>;
+}
+
+export function AtMentionCommandPlugin({
+  isCopilotPlus = false,
+  showTools = false,
+  currentActiveFile = null,
+  agentBrands = EMPTY_AGENT_MENTION_BRANDS,
+}: AtMentionCommandPluginProps): JSX.Element {
+  const app = useApp();
+  const [editor] = useLexicalComposerContext();
+  const [extendedState, setExtendedState] = useState<{
+    mode: "category" | "search";
+    selectedCategory?: AtMentionCategory;
+  }>({
+    mode: "category",
+  });
+
+  // State to track preview content for the currently highlighted note
+  const [currentPreviewContent, setCurrentPreviewContent] = useState<string>("");
+
+  // Use the shared at-mention categories hook. Action categories (e.g. Images,
+  // which opens a file picker) are not supported inline because the editor has
+  // no pill representation for them — they only appear in the `+` popover.
+  const allCategoryOptions = useAtMentionCategories(showTools, agentBrands.length > 0);
+  const availableCategoryOptions = useMemo(
+    () => allCategoryOptions.filter((c) => !c.isAction),
+    [allCategoryOptions]
+  );
+
+  // Load note content for preview using shared utilities
+  const loadNoteContentForPreview = useCallback(
+    async (file: TFile | null) => {
+      if (!file) {
+        setCurrentPreviewContent("");
+        return;
+      }
+      try {
+        // Handle PDF and canvas files - treat as empty content (no preview)
+        if (file.extension === "pdf" || file.extension === "canvas") {
+          setCurrentPreviewContent("");
+          return;
+        }
+
+        const content = await app.vault.cachedRead(file);
+        const contentWithoutFrontmatter = content
+          .replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, "")
+          .trim();
+        const truncatedContent =
+          contentWithoutFrontmatter.length > 300
+            ? contentWithoutFrontmatter.slice(0, 300) + "..."
+            : contentWithoutFrontmatter;
+
+        setCurrentPreviewContent(truncatedContent);
+      } catch {
+        setCurrentPreviewContent("内容加载失败");
+      }
+    },
+    [app]
+  );
+
+  // Temporary state for query to resolve circular dependency
+  const [currentQuery, setCurrentQuery] = useState("");
+
+  // Get search results using the unified search hook
+  const searchResults = useAtMentionSearch(
+    currentQuery,
+    extendedState.mode,
+    extendedState.selectedCategory,
+    isCopilotPlus,
+    showTools,
+    availableCategoryOptions,
+    currentActiveFile,
+    agentBrands
+  );
+
+  // Type guard functions
+  const isAtMentionOption = useCallback(
+    (option: CategoryOption | AtMentionOption): option is AtMentionOption => {
+      return "data" in option;
+    },
+    []
+  );
+
+  const isCategoryOption = useCallback(
+    (option: CategoryOption | AtMentionOption): option is CategoryOption => {
+      return "icon" in option && !("data" in option);
+    },
+    []
+  );
+
+  // Selection handler
+  const handleSelect = useCallback(
+    (option: CategoryOption | AtMentionOption) => {
+      if (extendedState.mode === "category" && isCategoryOption(option) && !currentQuery) {
+        // Category was selected - switch to search mode for that category
+        setExtendedState((prev) => ({
+          ...prev,
+          mode: "search",
+          selectedCategory: option.category,
+        }));
+        return;
+      }
+
+      // Item was selected - create appropriate pill using shared utility
+      if (isAtMentionOption(option)) {
+        // Check if this is the "Active Note" option by its category
+        if (option.category === "activeNote") {
+          // Create ActiveNotePillNode instead of regular NotePillNode
+          editor.update(() => {
+            $replaceTriggeredTextWithPill("@", { type: "active-note" });
+          });
+        } else if (!option.isAction) {
+          // isAction excludes action-only categories like "images"
+          const pillData: PillData = {
+            type: option.category as PillData["type"],
+            title: option.title,
+            data: option.data,
+          };
+
+          editor.update(() => {
+            $replaceTriggeredTextWithPill("@", pillData);
+          });
+        }
+      }
+    },
+    [extendedState.mode, currentQuery, isCategoryOption, isAtMentionOption, editor]
+  );
+
+  const onStateChangeCallback = useCallback((newState: { query: string; isOpen: boolean }) => {
+    setCurrentQuery(newState.query);
+    // Reset to category mode when menu closes
+    if (!newState.isOpen) {
+      setExtendedState({
+        mode: "category",
+        selectedCategory: undefined,
+      });
+    }
+  }, []);
+
+  // Use the shared typeahead hook
+  const { state, handleHighlight } = useTypeaheadPlugin({
+    triggerConfig: {
+      char: "@",
+      allowWhitespace: true,
+    },
+    options: searchResults,
+    onSelect: handleSelect,
+    onStateChange: onStateChangeCallback,
+  });
+
+  // Compute the currently selected file for preview, or null if not a note
+  const selectedFile = useMemo<TFile | null>(() => {
+    const selectedOption = searchResults[state.selectedIndex];
+    if (
+      selectedOption &&
+      isAtMentionOption(selectedOption) &&
+      selectedOption.category === "notes" &&
+      selectedOption.data instanceof TFile
+    ) {
+      return selectedOption.data;
+    }
+    return null;
+  }, [state.selectedIndex, searchResults, isAtMentionOption]);
+
+  // Load preview content when selected file changes
+  useEffect(() => {
+    void loadNoteContentForPreview(selectedFile);
+  }, [selectedFile, loadNoteContentForPreview]);
+
+  // Create display options with preview content for the highlighted note
+  const displayOptions = useMemo(() => {
+    // Add preview content to the currently highlighted option if it's a note
+    return searchResults.map((option, index) => {
+      if (
+        index === state.selectedIndex &&
+        isAtMentionOption(option) &&
+        option.category === "notes" &&
+        option.data instanceof TFile
+      ) {
+        return {
+          ...option,
+          content: currentPreviewContent,
+        };
+      }
+      return option;
+    });
+  }, [searchResults, state.selectedIndex, currentPreviewContent, isAtMentionOption]);
+
+  return (
+    <>
+      {state.isOpen && (
+        <TypeaheadMenuPortal
+          options={displayOptions}
+          selectedIndex={state.selectedIndex}
+          onSelect={handleSelect}
+          onHighlight={handleHighlight}
+          range={state.range}
+          query={state.query}
+          showPreview={
+            searchResults[state.selectedIndex] &&
+            isAtMentionOption(searchResults[state.selectedIndex]) &&
+            searchResults[state.selectedIndex].category === "notes"
+          }
+          mode={extendedState.mode}
+        />
+      )}
+    </>
+  );
+}

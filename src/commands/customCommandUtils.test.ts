@@ -1,0 +1,956 @@
+import { processPrompt } from "@/commands/customCommandUtils";
+import { validateCommandName } from "@/commands/customCommandUtils";
+import { CustomCommand } from "@/commands/type";
+import {
+  extractTemplateNoteFiles,
+  getFileContent,
+  getFileName,
+  getNotesFromPath,
+  getNotesFromTags,
+} from "@/utils";
+import { App, Notice, TFile, Vault } from "obsidian";
+import * as settingsModelModule from "@/settings/model";
+import { PromptSortStrategy } from "@/types";
+import { sortSlashCommands } from "@/commands/customCommandUtils";
+import { DEFAULT_SETTINGS } from "@/constants";
+import { logWarn } from "@/logger";
+import { mockTFile } from "@/__tests__/mockObsidian";
+
+// Mock Obsidian
+jest.mock("obsidian", () => ({
+  Notice: jest.fn(),
+  TFile: jest.fn(),
+  Vault: jest.fn(),
+}));
+
+// Mock logger
+jest.mock("@/logger", () => ({
+  logWarn: jest.fn(),
+  logInfo: jest.fn(),
+  logError: jest.fn(),
+}));
+
+// Mock the utility functions
+jest.mock("@/utils", () => {
+  const actual = jest.requireActual<{ stripFrontmatter: unknown }>("@/utils");
+  return {
+    extractTemplateNoteFiles: jest.fn().mockReturnValue([]),
+    getFileContent: jest.fn(),
+    getFileName: jest.fn(),
+    getNotesFromPath: jest.fn(),
+    getNotesFromTags: jest.fn(),
+    processVariableNameForNotePath: jest.fn(),
+    stripFrontmatter: actual.stripFrontmatter,
+  };
+});
+
+describe("processedPrompt()", () => {
+  let mockVault: Vault;
+  let mockApp: App;
+  let mockActiveNote: TFile;
+
+  beforeEach(() => {
+    // Reset mocks before each test
+    jest.clearAllMocks();
+    jest.resetAllMocks();
+
+    // Set default implementations for critical mocks
+    (extractTemplateNoteFiles as jest.Mock).mockReturnValue([]);
+
+    // Create mock objects with adapter.stat
+    mockVault = {
+      adapter: {
+        stat: jest.fn().mockResolvedValue({
+          ctime: Date.now(),
+          mtime: Date.now(),
+        }),
+      },
+    } as unknown as Vault;
+    mockApp = {
+      vault: mockVault,
+      metadataCache: { getFileCache: jest.fn() },
+      workspace: { getActiveFile: jest.fn() },
+      fileManager: { processFrontMatter: jest.fn() },
+    } as unknown as App;
+    mockActiveNote = mockTFile({
+      path: "path/to/active/note.md",
+      basename: "Active Note",
+    });
+  });
+
+  it("should add 1 context and selectedText", async () => {
+    const doc: CustomCommand = {
+      title: "test-prompt",
+      content: "This is a {variable} and {}.",
+      showInContextMenu: false,
+      showInSlashMenu: false,
+      order: 0,
+      modelKey: "",
+      lastUsedMs: 0,
+    };
+    const selectedText = "here is some selected text 12345";
+
+    (getFileContent as jest.Mock).mockResolvedValueOnce("here is the note content for note0");
+    (getFileName as jest.Mock).mockReturnValueOnce("Variable Note");
+    (getNotesFromPath as jest.Mock).mockReturnValueOnce([mockActiveNote]);
+
+    const result = await processPrompt(
+      mockApp,
+      doc.content,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toBe(
+      'This is a {variable} and {selected_text}.\n\n<selected_text>\nhere is some selected text 12345\n</selected_text>\n\n<variable name="variable">\n<variable_note>\n<path>path/to/active/note.md</path>\n## Variable Note\n\nhere is the note content for note0\n</variable_note>\n</variable>'
+    );
+    expect(result.includedFiles).toContain(mockActiveNote);
+  });
+
+  it("should add 2 context and no selectedText", async () => {
+    const doc: CustomCommand = {
+      title: "test-prompt",
+      content: "This is a {variable1} and {variable2}.",
+      showInContextMenu: false,
+      showInSlashMenu: false,
+      order: 0,
+      modelKey: "",
+      lastUsedMs: 0,
+    };
+    const selectedText = "";
+
+    (getFileContent as jest.Mock)
+      .mockResolvedValueOnce("here is the note content for note0")
+      .mockResolvedValueOnce("note content for note1");
+
+    const { getFileName } = jest.requireMock<{ getFileName: jest.Mock }>("@/utils");
+    getFileName.mockReturnValueOnce("Variable1 Note").mockReturnValueOnce("Variable2 Note");
+
+    const mockNote1 = mockTFile({ path: "path/to/note1.md", basename: "Variable1 Note" });
+    const mockNote2 = mockTFile({ path: "path/to/note2.md", basename: "Variable2 Note" });
+    (getNotesFromPath as jest.Mock)
+      .mockReturnValueOnce([mockNote1])
+      .mockReturnValueOnce([mockNote2]);
+
+    const result = await processPrompt(
+      mockApp,
+      doc.content,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toBe(
+      'This is a {variable1} and {variable2}.\n\n<variable name="variable1">\n<variable_note>\n<path>path/to/note1.md</path>\n## Variable1 Note\n\nhere is the note content for note0\n</variable_note>\n</variable>\n\n<variable name="variable2">\n<variable_note>\n<path>path/to/note2.md</path>\n## Variable2 Note\n\nnote content for note1\n</variable_note>\n</variable>'
+    );
+    expect(result.includedFiles).toContain(mockNote1);
+    expect(result.includedFiles).toContain(mockNote2);
+  });
+
+  it("should add 1 selectedText and no context", async () => {
+    const doc: CustomCommand = {
+      title: "test-prompt",
+      content: "Rewrite the following text {}",
+      showInContextMenu: false,
+      showInSlashMenu: false,
+      order: 0,
+      modelKey: "",
+      lastUsedMs: 0,
+    };
+    const selectedText = "here is some selected text 12345";
+
+    const result = await processPrompt(
+      mockApp,
+      doc.content,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toBe(
+      "Rewrite the following text {selected_text}\n\n<selected_text>\nhere is some selected text 12345\n</selected_text>"
+    );
+    expect(result.includedFiles).toEqual([]);
+  });
+
+  it("should treat {} as literal when skipEmptyBraces is true", async () => {
+    const customPrompt = "Rewrite the following text {}";
+    const selectedText = "here is some selected text 12345";
+
+    const result = await processPrompt(
+      mockApp,
+      customPrompt,
+      selectedText,
+      mockVault,
+      mockActiveNote,
+      true
+    );
+
+    // {} should be preserved as literal, not replaced
+    expect(result.processedPrompt).toBe("Rewrite the following text {}\n\n");
+    expect(result.includedFiles).toEqual([]);
+    expect(result.processedPrompt).not.toContain("<selected_text>");
+    expect(result.processedPrompt).not.toContain("{selected_text}");
+  });
+
+  it("should process {activeNote} correctly", async () => {
+    const doc: CustomCommand = {
+      title: "test-prompt",
+      content: "This is the active note: {activenote}",
+      showInContextMenu: false,
+      showInSlashMenu: false,
+      order: 0,
+      modelKey: "",
+      lastUsedMs: 0,
+    };
+    const selectedText = "";
+
+    (getFileContent as jest.Mock).mockResolvedValue("Content of the active note");
+    const { getFileName } = jest.requireMock<{ getFileName: jest.Mock }>("@/utils");
+    getFileName.mockReturnValue("Active Note");
+
+    const result = await processPrompt(
+      mockApp,
+      doc.content,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toBe(
+      'This is the active note: {activenote}\n\n<variable name="activenote">\n<variable_note>\n<path>path/to/active/note.md</path>\n## Active Note\n\nContent of the active note\n</variable_note>\n</variable>'
+    );
+    expect(result.includedFiles).toContain(mockActiveNote);
+    expect(getFileContent).toHaveBeenCalledWith(mockActiveNote, mockVault);
+  });
+
+  it("should handle {activeNote} when no active note is provided", async () => {
+    const doc: CustomCommand = {
+      title: "test-prompt",
+      content: "This is the active note: {activeNote}",
+      showInContextMenu: false,
+      showInSlashMenu: false,
+      order: 0,
+      modelKey: "",
+      lastUsedMs: 0,
+    };
+    const selectedText = "";
+
+    const result = await processPrompt(mockApp, doc.content, selectedText, mockVault, undefined);
+
+    expect(result.processedPrompt).toBe("This is the active note: {activeNote}\n\n");
+    expect(result.includedFiles).toEqual([]);
+    expect(Notice).toHaveBeenCalledWith("No active note found.");
+  });
+
+  it("should handle prompts without variables", async () => {
+    const doc: CustomCommand = {
+      title: "test-prompt",
+      content: "This is a test prompt with no variables.",
+      showInContextMenu: false,
+      showInSlashMenu: false,
+      order: 0,
+      modelKey: "",
+      lastUsedMs: 0,
+    };
+    const selectedText = "selected text";
+
+    const result = await processPrompt(
+      mockApp,
+      doc.content,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toBe("This is a test prompt with no variables.\n\n");
+    expect(result.includedFiles).toEqual([]);
+  });
+
+  it("should process a single tag variable correctly", async () => {
+    const customPrompt = "Notes related to {#tag} are:";
+    const selectedText = "";
+
+    // Mock note file for the tag
+    const mockNoteForTag = mockTFile({
+      path: "path/to/tagged/note.md",
+      basename: "Tagged Note",
+    });
+
+    // Mock getNotesFromTags to return our mock note
+    (getNotesFromTags as jest.Mock).mockReturnValue([mockNoteForTag]);
+
+    // Mock getFileName to return the basename
+    const { getFileName } = jest.requireMock<{ getFileName: jest.Mock }>("@/utils");
+    getFileName.mockReturnValue("Tagged Note");
+
+    // Mock getFileContent to return content for the note
+    (getFileContent as jest.Mock).mockResolvedValue("Note content for #tag");
+
+    const result = await processPrompt(
+      mockApp,
+      customPrompt,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toBe(
+      'Notes related to {#tag} are:\n\n<variable name="#tag">\n<variable_note>\n<path>path/to/tagged/note.md</path>\n## Tagged Note\n\nNote content for #tag\n</variable_note>\n</variable>'
+    );
+    expect(result.includedFiles).toContain(mockNoteForTag);
+  });
+
+  it("should process multiple tag variables correctly", async () => {
+    const customPrompt = "Notes related to {#tag1,#tag2,#tag3} are:";
+    const selectedText = "";
+
+    // Mock note files for the tags
+    const mockNoteForTag1 = mockTFile({
+      basename: "Tagged Note 1",
+      path: "path/to/tagged/note1.md",
+    });
+    const mockNoteForTag2 = mockTFile({
+      basename: "Tagged Note 2",
+      path: "path/to/tagged/note2.md",
+    });
+
+    // Mock getNotesFromTags to return our mock notes
+    (getNotesFromTags as jest.Mock).mockReturnValue([mockNoteForTag1, mockNoteForTag2]);
+
+    // Mock getFileName to return the basename
+    const { getFileName } = jest.requireMock<{ getFileName: jest.Mock }>("@/utils");
+    getFileName.mockImplementation((file: TFile) => file.basename);
+
+    // Mock getFileContent to return content for each note
+    (getFileContent as jest.Mock).mockImplementation((file: TFile) => {
+      if (file.basename === "Tagged Note 1") {
+        return "Note content for #tag1";
+      } else if (file.basename === "Tagged Note 2") {
+        return "Note content for #tag2";
+      }
+      return "";
+    });
+
+    const result = await processPrompt(
+      mockApp,
+      customPrompt,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toBe(
+      'Notes related to {#tag1,#tag2,#tag3} are:\n\n<variable name="#tag1,#tag2,#tag3">\n<variable_note>\n<path>path/to/tagged/note1.md</path>\n## Tagged Note 1\n\nNote content for #tag1\n</variable_note>\n\n<variable_note>\n<path>path/to/tagged/note2.md</path>\n## Tagged Note 2\n\nNote content for #tag2\n</variable_note>\n</variable>'
+    );
+    expect(result.includedFiles).toContain(mockNoteForTag1);
+    expect(result.includedFiles).toContain(mockNoteForTag2);
+  });
+
+  it("should process [[note title]] syntax correctly", async () => {
+    const customPrompt = "Content of [[Test Note]] is important.";
+    const selectedText = "";
+    const mockTestNote = mockTFile({ basename: "Test Note", path: "Test Note.md" });
+
+    // Mock the necessary functions
+    (extractTemplateNoteFiles as jest.Mock).mockReturnValue([mockTestNote]);
+    (getFileContent as jest.Mock).mockResolvedValue("Test note content");
+
+    const result = await processPrompt(
+      mockApp,
+      customPrompt,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toContain("Content of [[Test Note]] is important");
+    expect(result.processedPrompt).toContain("<note_context>");
+    expect(result.processedPrompt).toContain("<title>Test Note</title>");
+    expect(result.processedPrompt).toContain("<path>Test Note.md</path>");
+    expect(result.processedPrompt).toContain("Test note content");
+    expect(result.processedPrompt).toContain("</note_context>");
+    expect(result.includedFiles).toContain(mockTestNote);
+  });
+
+  it("should process {[[note title]]} syntax correctly without duplication", async () => {
+    const customPrompt = "Content of {[[Test Note]]} is important. Look at [[Test Note]].";
+    const selectedText = "";
+
+    // Mock the necessary functions
+    const mockNoteFile = mockTFile({
+      basename: "Test Note",
+      path: "Test Note.md",
+    });
+
+    (extractTemplateNoteFiles as jest.Mock).mockReturnValue([mockNoteFile]);
+
+    const { getFileName } = jest.requireMock<{ getFileName: jest.Mock }>("@/utils");
+    getFileName.mockReturnValue("Test Note");
+
+    (getFileContent as jest.Mock).mockResolvedValue("Test note content");
+
+    // Mock getNotesFromPath to return our mock note
+    (getNotesFromPath as jest.Mock).mockReturnValue([mockNoteFile]);
+
+    const result = await processPrompt(
+      mockApp,
+      customPrompt,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    // Verify the prompt text is preserved
+    expect(result.processedPrompt).toContain(
+      "Content of {[[Test Note]]} is important. Look at [[Test Note]]."
+    );
+    // Verify note content is included in note_context format
+    expect(result.processedPrompt).toContain("<note_context>");
+    expect(result.processedPrompt).toContain("<title>Test Note</title>");
+    expect(result.processedPrompt).toContain("<path>Test Note.md</path>");
+    expect(result.processedPrompt).toContain("Test note content");
+    expect(result.processedPrompt).toContain("</note_context>");
+    // Note: extractTemplateNoteFiles will only find {[[Test Note]]}, not bare [[Test Note]]
+    expect(result.includedFiles).toEqual([mockNoteFile]);
+    expect(extractTemplateNoteFiles).toHaveBeenCalledWith(customPrompt, mockVault);
+  });
+
+  it("should only process {[[note title]]} syntax, not bare [[note title]]", async () => {
+    const customPrompt = "{[[Note1]]} content and [[Note2]] are both important.";
+    const selectedText = "";
+
+    // Mock the necessary functions
+    const mockNote1 = mockTFile({
+      basename: "Note1",
+      path: "Note1.md",
+    });
+
+    // Only Note1 should be extracted since it's wrapped in {[[]]}
+    (extractTemplateNoteFiles as jest.Mock).mockReturnValue([mockNote1]);
+
+    const { getFileName } = jest.requireMock<{ getFileName: jest.Mock }>("@/utils");
+    getFileName.mockImplementation((file: TFile) => file.basename);
+
+    (getFileContent as jest.Mock).mockImplementation((file: TFile) => {
+      if (file.basename === "Note1") {
+        return "Note1 content";
+      }
+      return "";
+    });
+
+    // Mock getNotesFromPath to return our mock note
+    (getNotesFromPath as jest.Mock).mockReturnValue([mockNote1]);
+
+    const result = await processPrompt(
+      mockApp,
+      customPrompt,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toContain(
+      "{[[Note1]]} content and [[Note2]] are both important"
+    );
+    // Only Note1 content should be included (from {[[Note1]]})
+    expect(result.processedPrompt).toContain("<note_context>");
+    expect(result.processedPrompt).toContain("<title>Note1</title>");
+    expect(result.processedPrompt).toContain("<path>Note1.md</path>");
+    expect(result.processedPrompt).toContain("Note1 content");
+    expect(result.processedPrompt).toContain("</note_context>");
+    // Note2 should NOT be included because it's bare [[Note2]] without {}
+    expect(result.processedPrompt).not.toContain("<title>Note2</title>");
+    expect(result.includedFiles).toEqual([mockNote1]);
+    expect(result.includedFiles.length).toBe(1);
+  });
+
+  it("should handle multiple occurrences of {[[note title]]} syntax", async () => {
+    const customPrompt = "{[[Note1]]} is related to {[[Note2]]} and {[[Note3]]}.";
+    const selectedText = "";
+    const mockNote1 = mockTFile({ basename: "Note1", path: "Note1.md" });
+    const mockNote2 = mockTFile({ basename: "Note2", path: "Note2.md" });
+    const mockNote3 = mockTFile({ basename: "Note3", path: "Note3.md" });
+
+    // Mock the necessary functions
+    (extractTemplateNoteFiles as jest.Mock).mockReturnValue([mockNote1, mockNote2, mockNote3]);
+    (getNotesFromPath as jest.Mock).mockReturnValue([]);
+    (getFileContent as jest.Mock).mockImplementation((file: TFile) => {
+      if (file.basename === "Note1") {
+        return "Note1 content";
+      } else if (file.basename === "Note2") {
+        return "Note2 content";
+      } else if (file.basename === "Note3") {
+        return "Note3 content";
+      }
+      return "";
+    });
+
+    const result = await processPrompt(
+      mockApp,
+      customPrompt,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toContain(
+      "{[[Note1]]} is related to {[[Note2]]} and {[[Note3]]}."
+    );
+    // All notes should be in note_context format
+    expect(result.processedPrompt).toContain("<note_context>");
+    expect(result.processedPrompt).toContain("<title>Note1</title>");
+    expect(result.processedPrompt).toContain("<path>Note1.md</path>");
+    expect(result.processedPrompt).toContain("Note1 content");
+    expect(result.processedPrompt).toContain("<title>Note2</title>");
+    expect(result.processedPrompt).toContain("<path>Note2.md</path>");
+    expect(result.processedPrompt).toContain("Note2 content");
+    expect(result.processedPrompt).toContain("<title>Note3</title>");
+    expect(result.processedPrompt).toContain("<path>Note3.md</path>");
+    expect(result.processedPrompt).toContain("Note3 content");
+    expect(result.includedFiles).toEqual(expect.arrayContaining([mockNote1, mockNote2, mockNote3]));
+    expect(result.includedFiles.length).toBe(3);
+  });
+
+  it("should handle non-existent note titles gracefully", async () => {
+    const customPrompt = "[[Non-existent Note]] should not cause errors.";
+    const selectedText = "";
+
+    // Mock the necessary functions
+    (extractTemplateNoteFiles as jest.Mock).mockReturnValue([]); // Assume it returns empty if note doesn't exist
+
+    const result = await processPrompt(
+      mockApp,
+      customPrompt,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toBe("[[Non-existent Note]] should not cause errors.\n\n");
+    expect(result.includedFiles).toEqual([]);
+  });
+
+  it("should process {activenote} only once when it appears multiple times", async () => {
+    const doc: CustomCommand = {
+      title: "test-prompt",
+      content: "This is the active note: {activeNote}. And again: {activeNote}",
+      showInContextMenu: false,
+      showInSlashMenu: false,
+      order: 0,
+      modelKey: "",
+      lastUsedMs: 0,
+    };
+    const selectedText = "";
+
+    // Mock getFileName and getFileContent
+    const { getFileName } = jest.requireMock<{ getFileName: jest.Mock }>("@/utils");
+    getFileName.mockReturnValue("Active Note");
+
+    (getFileContent as jest.Mock).mockResolvedValue("Content of the active note");
+
+    const result = await processPrompt(
+      mockApp,
+      doc.content,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    // Check that getFileContent was called with the active note at least once
+    expect(getFileContent).toHaveBeenCalledWith(mockActiveNote, mockVault);
+    expect(result.processedPrompt).toBe(
+      'This is the active note: {activeNote}. And again: {activeNote}\n\n<variable name="activeNote">\n<variable_note>\n<path>path/to/active/note.md</path>\n## Active Note\n\nContent of the active note\n</variable_note>\n</variable>'
+    );
+    expect(result.includedFiles).toContain(mockActiveNote);
+  });
+
+  it("should use active note content when {} is present and no selected text", async () => {
+    const doc: CustomCommand = {
+      title: "test-prompt",
+      content: "Summarize this: {}",
+      showInContextMenu: false,
+      showInSlashMenu: false,
+      order: 0,
+      modelKey: "",
+      lastUsedMs: 0,
+    };
+    const selectedText = "";
+
+    (getFileContent as jest.Mock).mockResolvedValue("Content of the active note");
+
+    const result = await processPrompt(
+      mockApp,
+      doc.content,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toBe(
+      'Summarize this: {selected_text}\n\n<selected_text type="active_note">\nContent of the active note\n</selected_text>'
+    );
+    // Active note should be included because of {}
+    expect(result.includedFiles).toContain(mockActiveNote);
+  });
+
+  it("should not duplicate active note content when both {} and {activeNote} are present", async () => {
+    const doc: CustomCommand = {
+      title: "test-prompt",
+      content: "Summarize this: {}. Additional info: {activeNote}",
+      showInContextMenu: false,
+      showInSlashMenu: false,
+      order: 0,
+      modelKey: "",
+      lastUsedMs: 0,
+    };
+    const selectedText = "";
+
+    // Mock getFileContent for the active note when processed via {}
+    (getFileContent as jest.Mock).mockResolvedValue("Content of the active note");
+    const { getFileName } = jest.requireMock<{ getFileName: jest.Mock }>("@/utils");
+    getFileName.mockReturnValue("Active Note");
+
+    const result = await processPrompt(
+      mockApp,
+      doc.content,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toBe(
+      'Summarize this: {selected_text}. Additional info: {activeNote}\n\n<selected_text type="active_note">\nContent of the active note\n</selected_text>'
+    );
+    // Ensure getFileContent was called for the {} replacement
+    expect(getFileContent).toHaveBeenCalledWith(mockActiveNote, mockVault);
+    // Active note should be included only once
+    expect(result.includedFiles).toEqual([mockActiveNote]);
+  });
+
+  it("should prioritize selected text over active note when both are available", async () => {
+    const doc: CustomCommand = {
+      title: "test-prompt",
+      content: "Analyze this: {}",
+      showInContextMenu: false,
+      showInSlashMenu: false,
+      order: 0,
+      modelKey: "",
+      lastUsedMs: 0,
+    };
+    const selectedText = "This is the selected text";
+
+    (getFileContent as jest.Mock).mockResolvedValue("Content of the active note");
+
+    const result = await processPrompt(
+      mockApp,
+      doc.content,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toBe(
+      "Analyze this: {selected_text}\n\n<selected_text>\nThis is the selected text\n</selected_text>"
+    );
+    // Active note should not be included when selected text is present for {}
+    expect(result.includedFiles).toEqual([]);
+  });
+
+  it("should handle invalid variable names correctly", async () => {
+    const doc: CustomCommand = {
+      title: "test-prompt",
+      content: "This is a test prompt with {invalidVariable} name and {activeNote}",
+      showInContextMenu: false,
+      showInSlashMenu: false,
+      order: 0,
+      modelKey: "",
+      lastUsedMs: 0,
+    };
+
+    const selectedText = "";
+
+    (getNotesFromPath as jest.Mock).mockImplementation((_vault: Vault, variableName: string) => {
+      if (variableName === "Active Note") {
+        // Assuming processVariableNameForNotePath is mocked to return this
+        return [mockActiveNote];
+      }
+      return [];
+    });
+
+    (getFileName as jest.Mock).mockReturnValue(mockActiveNote.basename);
+    (getFileContent as jest.Mock).mockImplementation((file: TFile) => {
+      if (file.basename === "Active Note") {
+        return "Active Note Content";
+      }
+      return "";
+    });
+
+    const result = await processPrompt(
+      mockApp,
+      doc.content,
+      selectedText,
+      mockVault,
+      mockActiveNote
+    );
+
+    expect(result.processedPrompt).toBe(
+      'This is a test prompt with {invalidVariable} name and {activeNote}\n\n<variable name="activeNote">\n<variable_note>\n<path>path/to/active/note.md</path>\n## Active Note\n\nActive Note Content\n</variable_note>\n</variable>'
+    );
+    expect(result.includedFiles).toContain(mockActiveNote);
+    // Expect the warning for the invalid variable
+    expect(logWarn).toHaveBeenCalledWith("No notes found for variable: invalidVariable");
+  });
+});
+
+describe("sortSlashCommands", () => {
+  const sampleCommands = [
+    {
+      title: "Beta",
+      content: "",
+      showInContextMenu: false,
+      showInSlashMenu: true,
+      order: 2,
+      modelKey: "",
+      lastUsedMs: 100,
+    },
+    {
+      title: "Alpha",
+      content: "",
+      showInContextMenu: false,
+      showInSlashMenu: true,
+      order: 1,
+      modelKey: "",
+      lastUsedMs: 150,
+    },
+    {
+      title: "Gamma",
+      content: "",
+      showInContextMenu: false,
+      showInSlashMenu: true,
+      order: 3,
+      modelKey: "",
+      lastUsedMs: 200,
+    },
+  ];
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("sorts by recency (TIMESTAMP)", () => {
+    jest.spyOn(settingsModelModule, "getSettings").mockReturnValue({
+      ...DEFAULT_SETTINGS,
+      promptSortStrategy: PromptSortStrategy.TIMESTAMP,
+    });
+
+    const sorted = sortSlashCommands(sampleCommands);
+    expect(sorted.map((c: { title: string }) => c.title)).toEqual(["Gamma", "Alpha", "Beta"]);
+  });
+
+  it("sorts alphabetically (ALPHABETICAL)", () => {
+    jest.spyOn(settingsModelModule, "getSettings").mockReturnValue({
+      ...DEFAULT_SETTINGS,
+      promptSortStrategy: PromptSortStrategy.ALPHABETICAL,
+    });
+
+    const sorted = sortSlashCommands(sampleCommands);
+    expect(sorted.map((c: { title: string }) => c.title)).toEqual(["Alpha", "Beta", "Gamma"]);
+  });
+
+  it("sorts by manual order (MANUAL)", () => {
+    jest.spyOn(settingsModelModule, "getSettings").mockReturnValue({
+      ...DEFAULT_SETTINGS,
+      promptSortStrategy: PromptSortStrategy.MANUAL,
+    });
+    const sorted = sortSlashCommands(sampleCommands);
+    expect(sorted.map((c: { title: string }) => c.title)).toEqual(["Alpha", "Beta", "Gamma"]);
+  });
+
+  it("returns original order for unknown strategy", () => {
+    jest.spyOn(settingsModelModule, "getSettings").mockReturnValue({
+      ...DEFAULT_SETTINGS,
+      promptSortStrategy: "UNKNOWN",
+    });
+    const sorted = sortSlashCommands(sampleCommands);
+    expect(sorted).toEqual(sampleCommands);
+  });
+});
+
+describe("parseCustomCommandFile", () => {
+  interface MockFrontmatter {
+    "copilot-command-context-menu-enabled"?: boolean;
+    "copilot-command-slash-enabled"?: boolean;
+    "copilot-command-context-menu-order"?: number;
+    "copilot-command-model-key"?: string;
+    "copilot-command-last-used"?: number;
+  }
+  interface MockMetadata {
+    frontmatter: MockFrontmatter;
+  }
+  interface MockAppLike {
+    vault: { read: jest.Mock };
+    metadataCache: { getFileCache: jest.Mock };
+  }
+  type AppRef = { app: unknown };
+
+  let originalApp: unknown;
+  let mockFile: TFile;
+  let mockFrontmatter: MockFrontmatter;
+  let mockMetadata: MockMetadata;
+
+  beforeEach(() => {
+    // Save and mock global app
+    originalApp = (window as unknown as AppRef).app;
+    mockFrontmatter = {
+      "copilot-command-context-menu-enabled": true,
+      "copilot-command-slash-enabled": false,
+      "copilot-command-context-menu-order": 42,
+      "copilot-command-model-key": "gpt-4",
+      "copilot-command-last-used": 1234567890,
+    };
+    mockMetadata = { frontmatter: mockFrontmatter };
+    const mockedApp: MockAppLike = {
+      vault: {
+        read: jest
+          .fn()
+          .mockResolvedValue(
+            "---\ncopilot-command-context-menu-enabled: true\ncopilot-command-slash-enabled: false\ncopilot-command-context-menu-order: 42\ncopilot-command-model-key: gpt-4\ncopilot-command-last-used: 1234567890\n---\nPrompt content here."
+          ),
+      },
+      metadataCache: {
+        getFileCache: jest.fn().mockReturnValue(mockMetadata),
+      },
+    };
+    (window as unknown as AppRef).app = mockedApp;
+    mockFile = mockTFile({
+      basename: "Test Command",
+      extension: "md",
+      path: "CustomCommands/Test Command.md",
+    });
+  });
+
+  afterEach(() => {
+    (window as unknown as AppRef).app = originalApp;
+  });
+
+  it("parses a custom command file with frontmatter and content", async () => {
+    const { parseCustomCommandFile } = await import("@/commands/customCommandUtils");
+    const result = await parseCustomCommandFile(window.app, mockFile);
+    expect(result).toEqual({
+      title: "Test Command",
+      modelKey: "gpt-4",
+      content: "Prompt content here.",
+      showInContextMenu: true,
+      showInSlashMenu: false,
+      order: 42,
+      lastUsedMs: 1234567890,
+    });
+    expect(app.vault.read).toHaveBeenCalledWith(mockFile);
+    expect(app.metadataCache.getFileCache).toHaveBeenCalledWith(mockFile);
+  });
+
+  it("uses EMPTY_COMMAND defaults if frontmatter is missing", async () => {
+    (window.app.vault as unknown as { read: jest.Mock }).read.mockResolvedValue(
+      "Prompt content only, no frontmatter."
+    );
+    (
+      window.app.metadataCache as unknown as { getFileCache: jest.Mock }
+    ).getFileCache.mockReturnValue({});
+    const { parseCustomCommandFile } = await import("@/commands/customCommandUtils");
+    const result = await parseCustomCommandFile(window.app, mockFile);
+    expect(result).toEqual({
+      title: "Test Command",
+      modelKey: "",
+      content: "Prompt content only, no frontmatter.",
+      showInContextMenu: true,
+      showInSlashMenu: true,
+      order: 0,
+      lastUsedMs: 0,
+    });
+  });
+});
+
+describe("validateCommandName", () => {
+  const baseCommands = [
+    {
+      title: "Command One",
+      content: "",
+      showInContextMenu: false,
+      showInSlashMenu: false,
+      order: 0,
+      modelKey: "",
+      lastUsedMs: 0,
+    },
+    {
+      title: "Command Two",
+      content: "",
+      showInContextMenu: false,
+      showInSlashMenu: false,
+      order: 0,
+      modelKey: "",
+      lastUsedMs: 0,
+    },
+    {
+      title: "Another Command",
+      content: "",
+      showInContextMenu: false,
+      showInSlashMenu: false,
+      order: 0,
+      modelKey: "",
+      lastUsedMs: 0,
+    },
+  ];
+
+  it("returns null for a unique, valid name", () => {
+    expect(validateCommandName("New Command", baseCommands)).toBeNull();
+  });
+
+  it("returns error for duplicate name (case-insensitive)", () => {
+    expect(validateCommandName("command one", baseCommands)).toBe(
+      "A command with this name already exists"
+    );
+    expect(validateCommandName("COMMAND TWO", baseCommands)).toBe(
+      "A command with this name already exists"
+    );
+  });
+
+  it("returns error for invalid characters", () => {
+    const invalids = [
+      "Invalid#Name",
+      "Invalid<Name>",
+      'Invalid:"Name"',
+      "Invalid/Name",
+      "Invalid\\Name",
+      "Invalid|Name",
+      "Invalid?Name",
+      "Invalid*Name",
+      "Invalid[Name]",
+      "Invalid^Name",
+      "Invalid\x00Name",
+      "Invalid\x1FName",
+    ];
+    for (const name of invalids) {
+      expect(validateCommandName(name, baseCommands)).toMatch(
+        /Command name contains invalid characters/
+      );
+    }
+  });
+
+  it("returns null if unchanged currentCommandName", () => {
+    expect(validateCommandName("Command One", baseCommands, "Command One")).toBeNull();
+  });
+
+  it("returns error for names with leading or trailing whitespace", () => {
+    expect(validateCommandName("  Command One  ", baseCommands)).toBe(
+      "Command name cannot have leading or trailing spaces"
+    );
+    expect(validateCommandName(" Leading", baseCommands)).toBe(
+      "Command name cannot have leading or trailing spaces"
+    );
+    expect(validateCommandName("Trailing ", baseCommands)).toBe(
+      "Command name cannot have leading or trailing spaces"
+    );
+  });
+});

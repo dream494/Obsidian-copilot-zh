@@ -1,0 +1,190 @@
+import { executeSequentialToolCall, type ToolCall } from "./toolExecution";
+import { createLangChainTool } from "@/tools/createLangChainTool";
+import { ToolRegistry } from "@/tools/ToolRegistry";
+import { z } from "zod";
+
+// Mock dependencies
+jest.mock("@/plusUtils", () => ({
+  checkIsPaidUser: jest.fn(),
+  isSelfHostModeValid: jest.fn().mockReturnValue(false),
+}));
+
+jest.mock("@/logger", () => ({
+  logError: jest.fn(),
+  logInfo: jest.fn(),
+  logWarn: jest.fn(),
+}));
+
+jest.mock("@/tools/toolManager", () => ({
+  ToolManager: {
+    callTool: jest.fn(),
+  },
+}));
+
+import { checkIsPaidUser } from "@/plusUtils";
+import { ToolManager } from "@/tools/toolManager";
+
+describe("toolExecution", () => {
+  const mockCheckIsPaidUser = checkIsPaidUser as jest.MockedFunction<typeof checkIsPaidUser>;
+  const mockCallTool = ToolManager.callTool as jest.MockedFunction<typeof ToolManager.callTool>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // Clear the registry before each test
+    ToolRegistry.getInstance().clear();
+  });
+
+  describe("executeSequentialToolCall", () => {
+    it("should execute tools without isPlusOnly flag", async () => {
+      const testTool = createLangChainTool({
+        name: "testTool",
+        description: "Test tool",
+        schema: z.object({ input: z.string() }),
+        func: async ({ input }) => `Result: ${input}`,
+      });
+
+      // Register tool without isPlusOnly
+      ToolRegistry.getInstance().register({
+        tool: testTool,
+        metadata: {
+          id: "testTool",
+          displayName: "Test Tool",
+          description: "Test tool",
+          category: "custom",
+        },
+      });
+
+      mockCallTool.mockResolvedValueOnce("Tool executed successfully");
+
+      const result = await executeSequentialToolCall(
+        { name: "testTool", args: { input: "test" } },
+        [testTool]
+      );
+
+      expect(result).toEqual({
+        toolName: "testTool",
+        result: "Tool executed successfully",
+        success: true,
+      });
+      expect(mockCheckIsPaidUser).not.toHaveBeenCalled();
+    });
+
+    it("should block plus-only tools for non-plus users", async () => {
+      const plusTool = createLangChainTool({
+        name: "plusTool",
+        description: "Plus-only tool",
+        schema: z.object({}),
+        func: async () => "Should not execute",
+      });
+
+      // Register tool with isPlusOnly metadata
+      ToolRegistry.getInstance().register({
+        tool: plusTool,
+        metadata: {
+          id: "plusTool",
+          displayName: "Plus Tool",
+          description: "Plus-only tool",
+          category: "custom",
+          isPlusOnly: true,
+        },
+      });
+
+      mockCheckIsPaidUser.mockResolvedValueOnce(false);
+
+      const result = await executeSequentialToolCall({ name: "plusTool", args: {} }, [plusTool]);
+
+      expect(result).toEqual({
+        toolName: "plusTool",
+        result: "Error: plusTool requires a Copilot Plus subscription",
+        success: false,
+      });
+      expect(mockCheckIsPaidUser).toHaveBeenCalledWith(undefined, { trigger: "tool_call" });
+      expect(mockCallTool).not.toHaveBeenCalled();
+    });
+
+    it("should allow plus-only tools for plus users", async () => {
+      const plusTool = createLangChainTool({
+        name: "plusTool",
+        description: "Plus-only tool",
+        schema: z.object({}),
+        func: async () => "Plus tool executed",
+      });
+
+      // Register tool with isPlusOnly metadata
+      ToolRegistry.getInstance().register({
+        tool: plusTool,
+        metadata: {
+          id: "plusTool",
+          displayName: "Plus Tool",
+          description: "Plus-only tool",
+          category: "custom",
+          isPlusOnly: true,
+        },
+      });
+
+      mockCheckIsPaidUser.mockResolvedValueOnce(true);
+      mockCallTool.mockResolvedValueOnce("Plus tool executed");
+
+      const result = await executeSequentialToolCall({ name: "plusTool", args: {} }, [plusTool]);
+
+      expect(result).toEqual({
+        toolName: "plusTool",
+        result: "Plus tool executed",
+        success: true,
+      });
+      expect(mockCheckIsPaidUser).toHaveBeenCalled();
+      expect(mockCallTool).toHaveBeenCalled();
+    });
+
+    it("should handle tool not found", async () => {
+      const result = await executeSequentialToolCall({ name: "unknownTool", args: {} }, []);
+
+      expect(result).toEqual({
+        toolName: "unknownTool",
+        result:
+          "Error: Tool 'unknownTool' not found. Available tools: . Make sure you have the tool enabled in the Agent settings.",
+        success: false,
+      });
+    });
+
+    it("should handle invalid tool call", async () => {
+      const result = await executeSequentialToolCall(null as unknown as ToolCall, []);
+
+      expect(result).toEqual({
+        toolName: "unknown",
+        result: "Error: Invalid tool call - missing tool name",
+        success: false,
+      });
+    });
+
+    it("should execute writeFile normally for any file path", async () => {
+      const writeFile = createLangChainTool({
+        name: "writeFile",
+        description: "Write to file",
+        schema: z.object({ path: z.string(), content: z.string() }),
+        func: async () => "written",
+      });
+      const obsidianBases = createLangChainTool({
+        name: "obsidianBases",
+        description: "Bases CLI",
+        schema: z.object({ command: z.string() }),
+        func: async () => "queried",
+      });
+
+      ToolRegistry.getInstance().register({
+        tool: writeFile,
+        metadata: { id: "writeFile", displayName: "Write", description: "", category: "file" },
+      });
+
+      mockCallTool.mockResolvedValueOnce("File written");
+
+      const result = await executeSequentialToolCall(
+        { name: "writeFile", args: { path: "Notes/todo.md", content: "# Todo" } },
+        [writeFile, obsidianBases]
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockCallTool).toHaveBeenCalled();
+    });
+  });
+});

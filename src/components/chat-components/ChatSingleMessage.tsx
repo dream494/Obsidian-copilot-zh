@@ -1,0 +1,1026 @@
+import { ChatButtons } from "@/components/chat-components/ChatButtons";
+import { AssistantResponseFooter } from "@/components/ui/AssistantResponseFooter";
+import { SourcesModal } from "@/components/modals/SourcesModal";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  ContextFolderBadge,
+  ContextNoteBadge,
+  ContextSelectedTextBadge,
+  ContextTagBadge,
+  ContextUrlBadge,
+  ContextWebTabBadge,
+} from "@/components/chat-components/ContextBadges";
+import { InlineMessageEditor } from "@/components/chat-components/InlineMessageEditor";
+import {
+  cleanupMessageErrorBlockRoots,
+  cleanupMessageToolCallRoots,
+  cleanupStaleErrorBlockRoots,
+  cleanupStaleToolCallRoots,
+  ensureErrorBlockRoot,
+  ensureToolCallRoot,
+  getMessageErrorBlockRoots,
+  getMessageToolCallRoots,
+  removeErrorBlockRoot,
+  removeToolCallRoot,
+  renderErrorBlock,
+  renderToolCallBanner,
+  type ToolCallRootRecord,
+} from "@/components/chat-components/toolCallRootManager";
+import { AgentReasoningBlock } from "@/components/chat-components/AgentReasoningBlock";
+import { USER_SENDER } from "@/constants";
+import { cn } from "@/lib/utils";
+import { parseToolCallMarkers } from "@/LLMProviders/chainRunner/utils/toolCallParser";
+import { parseReasoningBlock } from "@/LLMProviders/chainRunner/utils/AgentReasoningState";
+import { processInlineCitations } from "@/LLMProviders/chainRunner/utils/citationUtils";
+import { logError } from "@/logger";
+import { ChatMessage } from "@/types/message";
+import { extractYoutubeVideoId, insertAtCursor } from "@/utils";
+import { preprocessAIResponse } from "@/utils/markdownPreprocess";
+import { renderMarkdown } from "@/utils/renderMarkdown";
+import { App, Component, TFile } from "obsidian";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSettingsValue } from "@/settings/model";
+import {
+  buildCopilotCollapsibleDomId,
+  captureCopilotCollapsibleOpenStates,
+  getCopilotCollapsibleDetailsFromEvent,
+  getMessageCollapsibleStates,
+  isEventWithinDetailsSummary,
+} from "@/components/chat-components/collapsibleStateUtils";
+
+const FOOTNOTE_SUFFIX_PATTERN = /^\d+-\d+$/;
+
+/**
+ * Normalizes rendered markdown footnotes to align with inline citation UX.
+ * Removes separators/backrefs and fixes numbering artifacts (e.g., "2-1").
+ */
+export const normalizeFootnoteRendering = (root: HTMLElement): void => {
+  const footnoteSection = root.querySelector(".footnotes");
+
+  if (footnoteSection) {
+    footnoteSection.querySelectorAll("hr, hr.footnotes-sep").forEach((el) => el.remove());
+    footnoteSection
+      .querySelectorAll("a.footnote-backref, a.footnote-link.footnote-backref")
+      .forEach((el) => el.remove());
+  } else {
+    root
+      .querySelectorAll("a.footnote-backref, a.footnote-link.footnote-backref")
+      .forEach((el) => el.remove());
+  }
+
+  root
+    .querySelectorAll(
+      'a.footnote-ref, sup a[href^="#fn"], sup a[href^="#fn-"], a[href^="#fn"], a[href^="#fn-"]'
+    )
+    .forEach((anchor) => {
+      const text = anchor.textContent?.trim() ?? "";
+      if (!text || !FOOTNOTE_SUFFIX_PATTERN.test(text)) {
+        return;
+      }
+
+      const [primary] = text.split("-");
+      if (primary && primary !== text) {
+        anchor.textContent = primary;
+      }
+    });
+};
+
+const INLINE_CITATION_RE = /\[(\d+(?:\s*,\s*\d+)*)\]/g;
+
+/**
+ * Makes inline citation numbers (e.g., [1], [2]) clickable by linking them
+ * to the corresponding source note. Reads the source mapping from the
+ * rendered .copilot-sources section in the same message.
+ */
+const linkInlineCitations = (root: HTMLElement): void => {
+  // Build citation number -> source anchor mapping from the rendered sources section.
+  // We store the anchor element (not just the href) so we can copy Obsidian-specific
+  // attributes like data-href and class="internal-link" onto the inline citation link.
+  const sourceItems = root.querySelectorAll(".copilot-sources__item");
+  if (sourceItems.length === 0) return;
+
+  const citationAnchors = new Map<number, HTMLAnchorElement>();
+  sourceItems.forEach((item) => {
+    const indexEl = item.querySelector(".copilot-sources__index");
+    const textEl = item.querySelector(".copilot-sources__text");
+    if (!indexEl || !textEl) return;
+
+    const indexMatch = indexEl.textContent?.match(/\[(\d+)\]/);
+    if (!indexMatch) return;
+    const num = parseInt(indexMatch[1], 10);
+
+    const link = textEl.querySelector("a");
+    if (link) {
+      citationAnchors.set(num, link);
+    }
+  });
+
+  if (citationAnchors.size === 0) return;
+
+  // Bind DOM ops to the document that owns `root` — the chat message may live
+  // in an Obsidian popout while a different window is focused, in which case
+  // `activeDocument` would create nodes with the wrong owner.
+  const doc = root.doc;
+
+  // Collect text nodes that contain citation patterns (outside sources section)
+  const sourcesEl = root.querySelector(".copilot-sources");
+  const textNodes: Text[] = [];
+  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (sourcesEl?.contains(node)) return NodeFilter.FILTER_REJECT;
+      if (node.parentElement?.closest("code, pre")) return NodeFilter.FILTER_REJECT;
+      INLINE_CITATION_RE.lastIndex = 0;
+      if (INLINE_CITATION_RE.test(node.textContent || "")) {
+        INLINE_CITATION_RE.lastIndex = 0;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+      return NodeFilter.FILTER_REJECT;
+    },
+  });
+
+  let n: Text | null;
+  while ((n = walker.nextNode() as Text | null)) textNodes.push(n);
+
+  // Replace citation text with clickable links
+  textNodes.forEach((node) => {
+    const text = node.textContent || "";
+    INLINE_CITATION_RE.lastIndex = 0;
+
+    const fragment = doc.win.createFragment();
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+
+    while ((match = INLINE_CITATION_RE.exec(text)) !== null) {
+      // Text before the citation
+      if (match.index > lastIndex) {
+        fragment.appendChild(doc.createTextNode(text.slice(lastIndex, match.index)));
+      }
+
+      const nums = match[1].split(/\s*,\s*/).map((s) => parseInt(s.trim(), 10));
+      const allResolved = nums.every((num) => citationAnchors.has(num));
+
+      if (allResolved) {
+        const span = doc.win.createSpan("copilot-citation-group");
+        span.appendChild(doc.createTextNode("["));
+        nums.forEach((num, i) => {
+          if (i > 0) span.appendChild(doc.createTextNode(", "));
+          const sourceAnchor = citationAnchors.get(num)!;
+          const link = doc.win.createEl("a");
+          // Copy all attributes from the source anchor so Obsidian internal-link
+          // metadata (e.g. data-href, class="internal-link") is preserved.
+          for (const attr of Array.from(sourceAnchor.attributes)) {
+            link.setAttribute(attr.name, attr.value);
+          }
+          // Override class and add our citation-specific styling
+          link.className = `copilot-citation-link${sourceAnchor.className ? ` ${sourceAnchor.className}` : ""}`;
+          link.textContent = String(num);
+          link.setAttribute("aria-label", `来源 ${num}`);
+          span.appendChild(link);
+        });
+        span.appendChild(doc.createTextNode("]"));
+        fragment.appendChild(span);
+      } else {
+        fragment.appendChild(doc.createTextNode(match[0]));
+      }
+
+      lastIndex = match.index + match[0].length;
+    }
+
+    if (lastIndex < text.length) {
+      fragment.appendChild(doc.createTextNode(text.slice(lastIndex)));
+    }
+
+    // If the text node is inside a placeholder span, replace the span itself
+    // so the placeholder wrapper is cleanly removed.
+    const replaceTarget = node.parentElement?.classList.contains("copilot-citation-ref")
+      ? node.parentElement
+      : node;
+    replaceTarget.parentNode?.replaceChild(fragment, replaceTarget);
+  });
+};
+
+function MessageContext({ context }: { context: ChatMessage["context"] }) {
+  if (
+    !context ||
+    (!context.notes?.length &&
+      !context.urls?.length &&
+      !context.webTabs?.length &&
+      !context.tags?.length &&
+      !context.folders?.length &&
+      !context.selectedTextContexts?.length)
+  ) {
+    return null;
+  }
+
+  return (
+    <div className="tw-flex tw-flex-wrap tw-gap-2">
+      {context.notes.map((note, index) => (
+        // eslint-disable-next-line @eslint-react/no-array-index-key -- context arrays may contain duplicate notes (see MessageContext.test.tsx duplicate-handling cases)
+        <Tooltip key={`note-${index}-${note.path}`}>
+          <TooltipTrigger asChild>
+            <div>
+              <ContextNoteBadge note={note} />
+            </div>
+          </TooltipTrigger>
+          <TooltipContent className="tw-max-w-sm tw-break-words">{note.path}</TooltipContent>
+        </Tooltip>
+      ))}
+      {context.urls.map((url, index) => (
+        // eslint-disable-next-line @eslint-react/no-array-index-key -- context arrays may contain duplicate urls (see MessageContext.test.tsx duplicate-handling cases)
+        <Tooltip key={`url-${index}-${url}`}>
+          <TooltipTrigger asChild>
+            <div>
+              <ContextUrlBadge url={url} />
+            </div>
+          </TooltipTrigger>
+          <TooltipContent className="tw-max-w-sm tw-break-words">{url}</TooltipContent>
+        </Tooltip>
+      ))}
+      {context.webTabs?.map((webTab, index) => (
+        // eslint-disable-next-line @eslint-react/no-array-index-key -- context arrays may contain duplicates; index disambiguates same-url entries
+        <Tooltip key={`webTab-${index}-${webTab.url}`}>
+          <TooltipTrigger asChild>
+            <div>
+              <ContextWebTabBadge webTab={webTab} />
+            </div>
+          </TooltipTrigger>
+          <TooltipContent className="tw-max-w-sm tw-break-words">
+            {webTab.title ? (
+              <div className="tw-text-left">
+                <div className="tw-font-medium">{webTab.title}</div>
+                <div>{webTab.url}</div>
+              </div>
+            ) : (
+              webTab.url
+            )}
+          </TooltipContent>
+        </Tooltip>
+      ))}
+      {context.tags?.map((tag, index) => (
+        // eslint-disable-next-line @eslint-react/no-array-index-key -- context arrays may contain duplicates; index disambiguates same-value entries
+        <Tooltip key={`tag-${index}-${tag}`}>
+          <TooltipTrigger asChild>
+            <div>
+              <ContextTagBadge tag={tag} />
+            </div>
+          </TooltipTrigger>
+          <TooltipContent className="tw-max-w-sm tw-break-words">{tag}</TooltipContent>
+        </Tooltip>
+      ))}
+      {context.folders?.map((folder, index) => (
+        // eslint-disable-next-line @eslint-react/no-array-index-key -- context arrays may contain duplicates; index disambiguates same-value entries
+        <Tooltip key={`folder-${index}-${folder}`}>
+          <TooltipTrigger asChild>
+            <div>
+              <ContextFolderBadge folder={folder} />
+            </div>
+          </TooltipTrigger>
+          <TooltipContent className="tw-max-w-sm tw-break-words">{folder}</TooltipContent>
+        </Tooltip>
+      ))}
+      {context.selectedTextContexts?.map((selectedText, index) => (
+        // eslint-disable-next-line @eslint-react/no-array-index-key -- context arrays may contain duplicates; index disambiguates same-id entries
+        <Tooltip key={`selectedText-${index}-${selectedText.id}`}>
+          <TooltipTrigger asChild>
+            <div>
+              <ContextSelectedTextBadge selectedText={selectedText} />
+            </div>
+          </TooltipTrigger>
+          <TooltipContent className="tw-max-w-sm tw-break-words">
+            {selectedText.sourceType === "web" ? selectedText.url : selectedText.notePath}
+          </TooltipContent>
+        </Tooltip>
+      ))}
+    </div>
+  );
+}
+
+interface ChatSingleMessageProps {
+  message: ChatMessage;
+  app: App;
+  isStreaming: boolean;
+  onRegenerate?: () => void;
+  onEdit?: (newMessage: string) => void;
+  onDelete?: () => void;
+  /** Agent Mode metadata placed at the response footer's leading edge, before the timestamp. */
+  footerStart?: React.ReactNode;
+}
+
+const ChatSingleMessage: React.FC<ChatSingleMessageProps> = ({
+  message,
+  app,
+  isStreaming,
+  onRegenerate,
+  onEdit,
+  onDelete,
+  footerStart,
+}) => {
+  const [isEditing, setIsEditing] = useState<boolean>(false);
+  const parsedReasoningBlock = useMemo(
+    () => parseReasoningBlock(message.message),
+    [message.message]
+  );
+  const reasoningData = useMemo<{
+    status: "reasoning" | "collapsed" | "complete";
+    elapsedSeconds: number;
+    steps: string[];
+  } | null>(() => {
+    if (!parsedReasoningBlock?.hasReasoning || parsedReasoningBlock.status === "idle") {
+      return null;
+    }
+    return {
+      status: parsedReasoningBlock.status,
+      elapsedSeconds: parsedReasoningBlock.elapsedSeconds,
+      steps: parsedReasoningBlock.steps,
+    };
+  }, [parsedReasoningBlock]);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const componentRef = useRef<Component | null>(null);
+  const isUnmountingRef = useRef<boolean>(false);
+  // Use a stable ID for the message to preserve tool call roots across re-renders
+  // Prefer message.id (persistent) over timestamp.epoch (regenerated on load)
+  const messageId = useRef(
+    message.id ||
+      (message.timestamp?.epoch
+        ? String(message.timestamp.epoch)
+        : `temp-${Date.now()}-${Math.random()}`)
+  );
+
+  // Store roots in a global map to preserve them across component instances
+  const rootsRef = useRef<Map<string, ToolCallRootRecord>>(
+    getMessageToolCallRoots(messageId.current)
+  );
+
+  // Store error block roots separately to prevent ID collisions and race conditions
+  const errorRootsRef = useRef<Map<string, ToolCallRootRecord>>(
+    getMessageErrorBlockRoots(messageId.current)
+  );
+
+  // Get the global collapsible state map for this message
+  // This persists across component lifecycles (streaming -> final message)
+  // Use ref to avoid triggering re-renders when map contents change
+  const collapsibleOpenStateMapRef = useRef(getMessageCollapsibleStates(messageId.current));
+  const collapsibleOpenStateMap = collapsibleOpenStateMapRef.current;
+
+  // Check if current model has reasoning capability
+  const settings = useSettingsValue();
+
+  const preprocess = useCallback(
+    (content: string): string => {
+      const activeFile = app.workspace.getActiveFile();
+      const sourcePath = activeFile ? activeFile.path : "";
+
+      const processCollapsibleSection = (
+        content: string,
+        tagName: string,
+        summaryText: string,
+        streamingSummaryText: string
+      ): string => {
+        // Common styles as template strings
+        const detailsStyle = `margin: 0.5rem 0 1.5rem; padding: 0.75rem; border: 1px solid var(--background-modifier-border); border-radius: 4px; background-color: var(--background-secondary)`;
+        const summaryStyle = `cursor: pointer; color: var(--text-muted); font-size: 0.8em; margin-bottom: 0.5rem; user-select: none`;
+        const contentStyle = `margin-top: 0.75rem; padding: 0.75rem; border-radius: 4px; background-color: var(--background-primary)`;
+
+        const openTag = `<${tagName}>`;
+        let sectionIndex = 0;
+
+        // Trims content and appends \n so the closing </div> always lands on
+        // its own unindented line. Without this, content ending with a
+        // 4-space-indented line (a markdown code block) would cause </div> to
+        // be consumed by the code block and rendered as escaped literal text.
+        const ensureClosingTagOnNewLine = (text: string) => text.trim() + "\n";
+
+        const buildDetails = (sectionContent: string, openAttr: string, domId: string) =>
+          `<details id="${domId}"${openAttr} style="${detailsStyle}">` +
+          `<summary style="${summaryStyle}">${summaryText}</summary>` +
+          `<div class="tw-text-muted" style="${contentStyle}">${ensureClosingTagOnNewLine(sectionContent)}</div>` +
+          `</details>\n\n`;
+
+        // During streaming, if we find any tag that's either unclosed or being processed
+        if (isStreaming && content.includes(openTag)) {
+          // Replace any complete sections first
+          const completeRegex = new RegExp(`<${tagName}>([\\s\\S]*?)<\\/${tagName}>`, "g");
+          content = content.replace(completeRegex, (_match, sectionContent: string) => {
+            const sectionKey = `${tagName}-${sectionIndex}`;
+            sectionIndex += 1;
+            const domId = buildCopilotCollapsibleDomId(messageId.current, sectionKey);
+            // Check if user has explicitly set a state; if not, default to collapsed (original behavior)
+            const openAttribute = collapsibleOpenStateMap.get(domId) ? " open" : "";
+            return buildDetails(sectionContent, openAttribute, domId);
+          });
+
+          // Then handle any unclosed tag, but preserve the streamed content
+          const unClosedRegex = new RegExp(`<${tagName}>([\\s\\S]*)$`);
+          content = content.replace(
+            unClosedRegex,
+            (_match, partialContent: string) =>
+              `<div style="${detailsStyle}">` +
+              `<div style="${summaryStyle}">${streamingSummaryText}</div>` +
+              `<div class="tw-text-muted" style="${contentStyle}">${ensureClosingTagOnNewLine(partialContent)}</div>` +
+              `</div>`
+          );
+          return content;
+        }
+
+        // Not streaming, process all sections normally
+        const regex = new RegExp(`<${tagName}>([\\s\\S]*?)<\\/${tagName}>`, "g");
+        return content.replace(regex, (_match, sectionContent: string) => {
+          const sectionKey = `${tagName}-${sectionIndex}`;
+          sectionIndex += 1;
+          const domId = buildCopilotCollapsibleDomId(messageId.current, sectionKey);
+          // Restore open state from previous render
+          const openAttribute = collapsibleOpenStateMap.get(domId) ? " open" : "";
+          return buildDetails(sectionContent, openAttribute, domId);
+        });
+      };
+
+      const processThinkSection = (content: string): string => {
+        return processCollapsibleSection(content, "think", "思考了一段时间", "思考中…");
+      };
+
+      const processWriteFileSection = (content: string): string => {
+        // Normalise legacy <writeToFile> tags from saved history to <writeFile>
+        // so they continue to render correctly after the tool rename.
+        const normalizeLegacyTags = (text: string): string =>
+          text.replace(/<(\/?)writeToFile>/g, "<$1writeFile>");
+
+        // First, unwrap any XML codeblocks that contain writeFile tags
+        const unwrapXmlCodeblocks = (text: string): string => {
+          // Pattern to match XML codeblocks that contain writeFile tags (or legacy writeToFile)
+          const xmlCodeblockRegex =
+            /```(?:xml)?\s*([\s\S]*?<writeFile>[\s\S]*?<\/writeFile>[\s\S]*?)\s*```/g;
+
+          return text.replace(xmlCodeblockRegex, (_match: string, xmlContent: string) => {
+            // Extract just the content inside the codeblock and return it without the codeblock wrapper
+            return xmlContent.trim();
+          });
+        };
+
+        // During streaming, also handle unclosed writeFile tags in XML codeblocks
+        const unwrapStreamingXmlCodeblocks = (text: string): string => {
+          if (!isStreaming) return text;
+
+          // Pattern to match XML codeblocks that contain unclosed writeFile tags
+          const streamingXmlCodeblockRegex = /```xml\s*([\s\S]*?<writeFile>[\s\S]*?)$/g;
+
+          return text.replace(streamingXmlCodeblockRegex, (_match: string, xmlContent: string) => {
+            // Extract the content and return it without the codeblock wrapper
+            return xmlContent.trim();
+          });
+        };
+
+        // Normalise legacy tags, then unwrap XML codeblocks
+        let processedContent = normalizeLegacyTags(content);
+        processedContent = unwrapXmlCodeblocks(processedContent);
+        processedContent = unwrapStreamingXmlCodeblocks(processedContent);
+
+        // Then process the writeFile sections normally
+        return processCollapsibleSection(
+          processedContent,
+          "writeFile",
+          "已生成新内容",
+          "正在生成更改…"
+        );
+      };
+
+      const replaceLinks = (text: string, regex: RegExp, template: (file: TFile) => string) => {
+        // Split text into code blocks and non-code blocks
+        const parts = text.split(/(```[\s\S]*?```|`[^`]*`)/g);
+
+        return parts
+          .map((part, index) => {
+            // Even indices are normal text, odd indices are code blocks
+            if (index % 2 === 0) {
+              // Process links only in non-code blocks
+              return part.replace(regex, (match: string, selection: string) => {
+                const file = app.metadataCache.getFirstLinkpathDest(selection, sourcePath);
+                return file ? template(file) : match;
+              });
+            }
+            // Return code blocks unchanged
+            return part;
+          })
+          .join("");
+      };
+
+      // Common AI response preprocessing (LaTeX, dataview/tasks escaping)
+      const commonProcessed = preprocessAIResponse(content);
+
+      // Process only Obsidian internal images (starting with ![[)
+      const noteImageProcessed = replaceLinks(
+        commonProcessed,
+        /!\[\[(.*?)]]/g,
+        (file) => `![](${app.vault.getResourcePath(file)})`
+      );
+
+      // Process think sections (no-op if none); do not depend on current model selection
+      const thinkSectionProcessed = processThinkSection(noteImageProcessed);
+
+      // Process writeFile sections
+      const writeFileSectionProcessed = processWriteFileSection(thinkSectionProcessed);
+
+      // Transform markdown sources section into HTML structure
+      const sourcesSectionProcessed = processInlineCitations(
+        writeFileSectionProcessed,
+        settings.enableInlineCitations
+      );
+
+      // Wrap any remaining raw [^N] footnote marks as placeholder badges.
+      // During streaming, processInlineCitations can't process them until the
+      // sources section has streamed in. Without this, the markdown renderer
+      // interprets [^N] as footnote references and shows bare superscript numbers.
+      const citationPlaceholderProcessed = sourcesSectionProcessed.replace(
+        /\[\^(\d+)\](?!:)/g,
+        '<span class="copilot-citation-ref">[$1]</span>'
+      );
+
+      /**
+       * Converts YouTube video embeds to static thumbnails during streaming.
+       * This prevents iframe flickering caused by repeated DOM recreation.
+       * After streaming ends, the original embed syntax is preserved for full video display.
+       */
+      const processYouTubeEmbed = (content: string): string => {
+        if (!isStreaming) {
+          // After streaming: keep original syntax for full video embed
+          return content;
+        }
+
+        // Match ![title](url) format and check if URL is YouTube
+        const imageEmbedRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
+
+        return content.replace(imageEmbedRegex, (match, title: string, url: string) => {
+          const videoId = extractYoutubeVideoId(url);
+          if (!videoId) {
+            // Not a YouTube URL, keep original
+            return match;
+          }
+          // During streaming: convert to clickable thumbnail to avoid iframe reload flicker
+          const displayTitle = title || "YouTube 视频";
+          const thumbnail = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+          return `[![${displayTitle}](${thumbnail})](${url})`;
+        });
+      };
+
+      return processYouTubeEmbed(citationPlaceholderProcessed);
+    },
+    [app, isStreaming, settings.enableInlineCitations, collapsibleOpenStateMap]
+  );
+
+  // Persist collapsible open/closed state during streaming in real time.
+  // Streaming updates can rebuild the markdown DOM between pointer down/up, preventing a click.
+  useEffect(() => {
+    const root = contentRef.current;
+    if (!root || message.sender === USER_SENDER || !isStreaming) {
+      return;
+    }
+
+    /**
+     * Handles user click on collapsible summary during streaming.
+     * Directly sets details.open to avoid race conditions where DOM rebuilds
+     * between pointerdown and click, causing double toggle that cancels user intent.
+     */
+    const handleSummaryPointerDown = (event: Event): void => {
+      // Only handle primary button (left click)
+      if (event instanceof PointerEvent && (event.button !== 0 || !event.isPrimary)) {
+        return;
+      }
+
+      const details = getCopilotCollapsibleDetailsFromEvent(event, root);
+      if (!details || !isEventWithinDetailsSummary(event, details)) {
+        return;
+      }
+
+      // Calculate and apply the next state immediately
+      const nextOpen = !details.open;
+      details.open = nextOpen;
+      collapsibleOpenStateMap.set(details.id, nextOpen);
+    };
+
+    /**
+     * Prevents native click from triggering another toggle on <details>.
+     * Since we already handled the state change in pointerdown, block the default behavior.
+     */
+    const handleSummaryClick = (event: Event): void => {
+      const details = getCopilotCollapsibleDetailsFromEvent(event, root);
+      if (!details || !isEventWithinDetailsSummary(event, details)) {
+        return;
+      }
+      event.preventDefault();
+    };
+
+    /**
+     * Captures actual open/closed state changes from native <details> interactions.
+     */
+    const handleDetailsToggle = (event: Event): void => {
+      const details = getCopilotCollapsibleDetailsFromEvent(event, root);
+      if (!details) {
+        return;
+      }
+      collapsibleOpenStateMap.set(details.id, details.open);
+    };
+
+    // Use capture phase and listen on root (not document) to minimize scope
+    root.addEventListener("pointerdown", handleSummaryPointerDown, true);
+    root.addEventListener("click", handleSummaryClick, true);
+    root.addEventListener("toggle", handleDetailsToggle, true);
+    return () => {
+      root.removeEventListener("pointerdown", handleSummaryPointerDown, true);
+      root.removeEventListener("click", handleSummaryClick, true);
+      root.removeEventListener("toggle", handleDetailsToggle, true);
+    };
+  }, [isStreaming, message.sender, collapsibleOpenStateMap]);
+
+  useEffect(() => {
+    // Reset unmounting flag when effect runs
+    isUnmountingRef.current = false;
+
+    if (contentRef.current && message.sender !== USER_SENDER) {
+      // Create a new Component instance if it doesn't exist
+      if (!componentRef.current) {
+        componentRef.current = new Component();
+        componentRef.current.load();
+      }
+
+      // Capture open states of collapsible sections before re-rendering
+      // During streaming, don't overwrite user's explicit state changes from pointerdown
+      captureCopilotCollapsibleOpenStates(contentRef.current, collapsibleOpenStateMap, {
+        overwriteExisting: !isStreaming,
+      });
+
+      const originMessage = message.message;
+
+      // Use content after reasoning block (or full message if no reasoning block)
+      const messageContent = parsedReasoningBlock?.contentAfter ?? originMessage;
+      const processedMessage = preprocess(messageContent);
+      const parsedMessage = parseToolCallMarkers(processedMessage, messageId.current);
+
+      if (!isUnmountingRef.current) {
+        // Bind DOM ops to the document that owns the message container so
+        // popout-window chats don't pick up the wrong document if focus shifts.
+        const doc = contentRef.current.doc;
+        // Resolve internal links against the active note so vaults with
+        // duplicate basenames or heading-only links open the right file.
+        const sourcePath = app.workspace.getActiveFile()?.path ?? "";
+        // Track existing tool call and error block IDs
+        const existingToolCallIds = new Set<string>();
+        const existingErrorIds = new Set<string>();
+
+        const existingToolCalls = contentRef.current.querySelectorAll('[id^="tool-call-"]');
+        existingToolCalls.forEach((el) => {
+          const id = el.id.replace("tool-call-", "");
+          existingToolCallIds.add(id);
+        });
+
+        const existingErrors = contentRef.current.querySelectorAll('[id^="error-block-"]');
+        existingErrors.forEach((el) => {
+          const id = el.id.replace("error-block-", "");
+          existingErrorIds.add(id);
+        });
+
+        // Clear only text content divs, preserve tool call and error block containers
+        const textDivs = contentRef.current.querySelectorAll(".message-segment");
+        textDivs.forEach((div) => div.remove());
+
+        // Process segments and only update what's needed
+        let currentIndex = 0;
+        parsedMessage.segments.forEach((segment) => {
+          if (segment.type === "text" && segment.content.trim()) {
+            // Find where to insert this text segment
+            const insertBefore = contentRef.current!.children[currentIndex];
+
+            // `markdown-rendered` opts the container into Obsidian's native
+            // reading-view stylesheet so reloaded messages match the live
+            // render path (AgentMarkdownText). Most visibly, it restores the
+            // gray background pill on inline `<code>` spans.
+            const textDiv = doc.win.createDiv("message-segment markdown-rendered");
+
+            if (insertBefore) {
+              contentRef.current!.insertBefore(textDiv, insertBefore);
+            } else {
+              contentRef.current!.appendChild(textDiv);
+            }
+
+            void renderMarkdown(app, segment.content, textDiv, sourcePath, componentRef.current!)
+              .then(() => normalizeFootnoteRendering(textDiv))
+              .catch((err: unknown) => logError("renderMarkdown failed", err));
+            currentIndex++;
+          } else if (segment.type === "toolCall" && segment.toolCall) {
+            const toolCallId = segment.toolCall.id;
+            let container = doc.getElementById(`tool-call-${toolCallId}`);
+
+            if (!container) {
+              const insertBefore = contentRef.current!.children[currentIndex];
+              const toolDiv = doc.win.createDiv({
+                cls: "tool-call-container",
+                attr: { id: `tool-call-${toolCallId}` },
+              });
+
+              if (insertBefore) {
+                contentRef.current!.insertBefore(toolDiv, insertBefore);
+              } else {
+                contentRef.current!.appendChild(toolDiv);
+              }
+
+              container = toolDiv;
+            }
+
+            const rootRecord = ensureToolCallRoot(
+              app,
+              messageId.current,
+              rootsRef.current,
+              toolCallId,
+              container,
+              "render refresh"
+            );
+
+            if (!isUnmountingRef.current && !rootRecord.isUnmounting) {
+              renderToolCallBanner(rootRecord, segment.toolCall);
+            }
+
+            currentIndex++;
+          } else if (segment.type === "error" && segment.error) {
+            const errorId = segment.error.id;
+            let container = doc.getElementById(`error-block-${errorId}`);
+
+            if (!container) {
+              // Insert error block at the current stream position
+              const insertBefore = contentRef.current!.children[currentIndex];
+              const errorDiv = doc.win.createDiv({
+                cls: "error-block-container",
+                attr: { id: `error-block-${errorId}` },
+              });
+
+              if (insertBefore) {
+                contentRef.current!.insertBefore(errorDiv, insertBefore);
+              } else {
+                contentRef.current!.appendChild(errorDiv);
+              }
+
+              container = errorDiv;
+            }
+
+            // Use dedicated error block root to prevent ID collisions with tool calls
+            const rootRecord = ensureErrorBlockRoot(
+              app,
+              messageId.current,
+              errorRootsRef.current,
+              errorId,
+              container,
+              "error render"
+            );
+
+            if (!isUnmountingRef.current && !rootRecord.isUnmounting) {
+              renderErrorBlock(rootRecord, segment.error);
+            }
+
+            currentIndex++;
+          }
+        });
+
+        // Clean up any tool calls that no longer exist
+        const currentToolCallIds = new Set(
+          parsedMessage.segments
+            .filter((s) => s.type === "toolCall" && s.toolCall)
+            .map((s) => s.toolCall!.id)
+        );
+
+        existingToolCallIds.forEach((id) => {
+          if (!currentToolCallIds.has(id)) {
+            const element = doc.getElementById(`tool-call-${id}`);
+            if (element) {
+              removeToolCallRoot(messageId.current, rootsRef.current, id, "tool call removal");
+              element.remove();
+            }
+          }
+        });
+
+        // Clean up any error blocks that no longer exist
+        const currentErrorIds = new Set(
+          parsedMessage.segments
+            .filter((s) => s.type === "error" && s.error)
+            .map((s) => s.error!.id)
+        );
+
+        existingErrorIds.forEach((id) => {
+          if (!currentErrorIds.has(id)) {
+            const element = doc.getElementById(`error-block-${id}`);
+            if (element) {
+              removeErrorBlockRoot(
+                messageId.current,
+                errorRootsRef.current,
+                id,
+                "error block removal"
+              );
+              element.remove();
+            }
+          }
+        });
+
+        // Link inline citations only after streaming completes. During streaming
+        // the sources section is incomplete and the DOM is rebuilt every chunk,
+        // so linking mid-stream wastes cycles and causes visible flickering.
+        if (contentRef.current && !isStreaming) {
+          linkInlineCitations(contentRef.current);
+        }
+      }
+    }
+
+    // Cleanup function - no longer needed as roots are managed by toolCallRootManager
+    return () => {
+      isUnmountingRef.current = true;
+    };
+  }, [
+    message,
+    app,
+    componentRef,
+    isStreaming,
+    preprocess,
+    collapsibleOpenStateMap,
+    parsedReasoningBlock,
+  ]);
+
+  // Cleanup effect that only runs on component unmount
+  useEffect(() => {
+    const currentComponentRef = componentRef;
+    const currentMessageId = messageId.current;
+    const messageRootsSnapshot = rootsRef.current;
+    const errorRootsSnapshot = errorRootsRef.current;
+
+    // Clean up old message roots to prevent memory leaks (older than 1 hour)
+    const cleanupOldRoots = () => {
+      cleanupStaleToolCallRoots();
+      cleanupStaleErrorBlockRoots();
+    };
+
+    // Run cleanup on mount
+    cleanupOldRoots();
+
+    return () => {
+      // Set unmounting flag immediately
+      isUnmountingRef.current = true;
+
+      // Defer cleanup to avoid React rendering conflicts.
+      // eslint-disable-next-line @eslint-react/web-api/no-leaked-timeout -- fire-and-forget defer; no cleanup target available inside an effect-cleanup
+      window.setTimeout(() => {
+        // Clean up component
+        if (currentComponentRef.current) {
+          currentComponentRef.current.unload();
+          currentComponentRef.current = null;
+        }
+
+        // Only clean up roots if this is a temporary message (streaming message with temp- prefix).
+        // For shared messageId (msg-xxx), container changes are handled by ensureToolCallRoot/ensureErrorBlockRoot
+        // which detect container mismatch and recreate roots as needed.
+        if (currentMessageId.startsWith("temp-")) {
+          cleanupMessageToolCallRoots(currentMessageId, messageRootsSnapshot, "component cleanup");
+          cleanupMessageErrorBlockRoots(currentMessageId, errorRootsSnapshot, "component cleanup");
+        }
+      }, 0);
+    };
+  }, []); // Empty dependency array ensures this only runs on unmount
+
+  const handleEdit = () => {
+    setIsEditing(true);
+  };
+
+  const handleCancelEdit = () => {
+    setIsEditing(false);
+  };
+
+  const handleSaveEdit = (newText: string) => {
+    setIsEditing(false);
+    if (onEdit) {
+      onEdit(newText);
+    }
+  };
+
+  const handleShowSources = () => {
+    if (message.sources && message.sources.length > 0) {
+      new SourcesModal(app, message.sources).open();
+    }
+  };
+
+  const handleInsertIntoEditor = () => {
+    void insertAtCursor(app, message.message);
+  };
+
+  const renderMessageContent = () => {
+    if (message.content) {
+      return (
+        <div className="tw-flex tw-flex-col tw-gap-3">
+          {(message.content as Array<{ type: string; image_url?: { url: string } }>).map(
+            (item, index) => {
+              if (item.type === "text") {
+                return (
+                  // eslint-disable-next-line @eslint-react/no-array-index-key -- content array is fixed once message is rendered; items not reordered
+                  <div key={index}>
+                    {message.sender === USER_SENDER ? (
+                      <div className="tw-whitespace-pre-wrap tw-break-words tw-text-[calc(var(--font-text-size)_-_2px)] tw-font-normal">
+                        {message.message}
+                      </div>
+                    ) : (
+                      <div
+                        ref={contentRef}
+                        className={message.isErrorMessage ? "tw-text-error" : ""}
+                      ></div>
+                    )}
+                  </div>
+                );
+              } else if (item.type === "image_url") {
+                return (
+                  // eslint-disable-next-line @eslint-react/no-array-index-key -- content array is fixed once message is rendered; items not reordered
+                  <div key={index} className="message-image-content">
+                    <img
+                      src={item.image_url!.url}
+                      alt="用户上传的图片"
+                      className="chat-message-image"
+                    />
+                  </div>
+                );
+              }
+              return null;
+            }
+          )}
+        </div>
+      );
+    }
+
+    // Fallback for messages without content array
+    return message.sender === USER_SENDER ? (
+      <div className="tw-whitespace-pre-wrap tw-break-words tw-text-[calc(var(--font-text-size)_-_2px)] tw-font-normal">
+        {message.message}
+      </div>
+    ) : (
+      <div ref={contentRef} className={message.isErrorMessage ? "tw-text-error" : ""}></div>
+    );
+  };
+
+  // If editing a user message, replace the entire message container with the inline editor
+  if (isEditing && message.sender === USER_SENDER) {
+    return (
+      <div className="tw-my-1 tw-flex tw-w-full tw-flex-col">
+        <InlineMessageEditor
+          initialValue={message.message}
+          initialContext={message.context}
+          onSave={handleSaveEdit}
+          onCancel={handleCancelEdit}
+          app={app}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="tw-my-1 tw-flex tw-w-full tw-flex-col">
+      <div
+        className={cn(
+          "tw-group tw-mx-2 tw-rounded-md tw-p-2",
+          message.sender === USER_SENDER && "tw-border tw-border-solid tw-border-border"
+        )}
+        style={
+          message.sender === USER_SENDER
+            ? { backgroundColor: "var(--background-modifier-hover)" }
+            : undefined
+        }
+      >
+        <div className="tw-flex tw-max-w-full tw-flex-col tw-gap-2 tw-overflow-hidden">
+          {!isEditing && <MessageContext context={message.context} />}
+
+          {/* Agent Reasoning Block (if present) */}
+          {reasoningData && message.sender !== USER_SENDER && (
+            <AgentReasoningBlock
+              status={reasoningData.status}
+              elapsedSeconds={reasoningData.elapsedSeconds}
+              steps={reasoningData.steps}
+              isStreaming={isStreaming}
+            />
+          )}
+
+          <div className="message-content tw-break-words !tw-leading-[1.6]">
+            {renderMessageContent()}
+          </div>
+
+          {!isStreaming && (
+            <AssistantResponseFooter
+              leading={footerStart}
+              timestamp={message.timestamp?.display}
+              actions={
+                <ChatButtons
+                  message={message}
+                  onInsertIntoEditor={handleInsertIntoEditor}
+                  onRegenerate={onRegenerate}
+                  onEdit={onEdit ? handleEdit : undefined}
+                  onDelete={onDelete}
+                  onShowSources={handleShowSources}
+                  hasSources={message.sources && message.sources.length > 0 ? true : false}
+                />
+              }
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default ChatSingleMessage;

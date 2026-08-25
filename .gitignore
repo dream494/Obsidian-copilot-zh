@@ -1,0 +1,42 @@
+# vscode
+.vscode
+
+# Intellij
+*.iml
+.idea
+
+# npm
+node_modules
+
+# Don't include the compiled main.js file in the repo.
+# They should be uploaded to GitHub releases instead.
+main.js
+styles.css
+
+# Exclude sourcemaps
+*.map
+
+# obsidian
+data.json
+data/
+
+# Exclude macOS Finder (System Explorer) View States
+.DS_Store
+
+# Test Environment
+.env.test
+
+# Claude configuration
+.claude/settings.local.json
+.claude/worktrees/
+
+# Development session tracking
+TODO.md
+
+# ACP full-frame debug log (vault sidecar, may contain prompt/tool data)
+copilot/acp-frames.ndjson
+copilot/acp-frames.old.ndjson
+
+# Models.dev catalog cache (disposable runtime cache under .copilot/)
+.copilot/model-catalog-cache.json
+.otacon/

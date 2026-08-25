@@ -1,0 +1,14 @@
+{
+  "id": "copilot-zh",
+  "name": "Copilot 中文版",
+  "version": "4.0.2",
+  "minAppVersion": "1.11.4",
+  "isDesktopOnly": false,
+  "description": "在您的仓库中运行 Claude Code、Codex、OpenCode 等 AI 智能体，把第二大脑变成完成知识工作的智能助手。",
+  "author": "Logan Yang",
+  "authorUrl": "https://twitter.com/logancyang",
+  "fundingUrl": {
+    "Buy Me a Coffee": "https://www.buymeacoffee.com/logancyang",
+    "GitHub Sponsor": "https://github.com/sponsors/logancyang"
+  }
+}

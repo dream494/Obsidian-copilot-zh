@@ -1,0 +1,196 @@
+# Contributing to Copilot for Obsidian
+
+First off, thank you for considering contributing to Copilot for Obsidian! It's people like you who make Copilot for Obsidian such a great tool!
+
+## How Can I Contribute?
+
+### Reporting Bugs or Suggesting Enhancements
+
+Before submitting a bug report or suggestion, please check the [issues](https://github.com/logancyang/obsidian-copilot/issues) page for a list of currently known issues to ensure the bug has not already been reported. If it's a new bug or suggestion, create an issue and provide the following information:
+
+- Use a clear and descriptive title.
+- Describe the exact steps which reproduce the problem in as much detail as possible.
+- Provide specific examples to demonstrate these steps.
+- Describe the behavior you observed after following the steps, pointing out what exactly is the problem.
+- Explain which behavior you expected to see instead and why.
+- Include screenshots or animated GIFs showing you following the described steps and clearly demonstrating the problem.
+
+### Your First Code Contribution
+
+Unsure where to begin contributing to Copilot for Obsidian? You can start by looking through the `help-wanted` issues.
+
+### Pull Requests
+
+The process described here aims to:
+
+- Maintain the quality of Copilot for Obsidian.
+- Fix problems that are important to users.
+- Engage the community in working towards the best possible Copilot for Obsidian.
+- Enable a sustainable system for Copilot for Obsidian's maintainers to review contributions.
+
+Please follow these steps to have your contribution considered by the maintainers:
+
+1. Ensure the code adheres to a clean style consistent with the existing code.
+2. Thoroughly test your changes before submitting.
+3. Be descriptive in your pull request, linking to the issue it addresses, and showing screenshots demonstrating the change.
+4. Once you receive feedback, update the code accordingly to address them before your pull request can be ultimately accepted.
+
+### How to Set Up Dev Environment
+
+Here is a great [writeup by Daniel Haven](https://medium.com/gitconnected/how-to-set-up-the-ideal-obsidian-plugin-development-workflow-b222fe72280f) on the best practices for setting up your dev environment for Obsidian plugins.
+
+In the case of Copilot for Obsidian, you will need to:
+
+1. Fork the repo.
+2. Create a vault just for development.
+3. Clone the forked repo into your vault's `plugins` folder.
+4. Run `npm install` to install all dependencies.
+5. Install the recommended VS Code extensions (Prettier and ESLint).
+6. Ensure your editor respects the `.editorconfig` and Prettier settings.
+7. Run `npm run dev` in your repo to see the effect of your changes.
+8. Before committing, run `npm run format` to ensure all files are properly formatted.
+9. Before opening a pull request, run `npm run review:obsidian` as described below.
+10. When you are ready to make a pull request, ensure to make your changes in **a branch on your fork**, and then submit a pull request to the **main repo**.
+
+Try to be descriptive in your branch names and pull requests. Happy coding!
+
+### Obsidian community review preflight
+
+`npm run review:obsidian` reproduces the public Obsidian source, CSS, manifest/license, and runtime dependency checks. Errors fail the command; warnings remain visible for conservative follow-up work when an automatic cleanup could change plugin behavior or UI. The command rebuilds and scans the packaged `styles.css`, then runs rejection fixtures to ensure every guarded review family is still detected.
+
+ESLint and Stylelint findings include the file, line, rule, and message; the same details appear as annotations in GitHub Actions. Dependency-audit findings remain visible for explicit, compatibility-tested follow-up work; critical advisories block the preflight.
+
+The upstream review packages are pinned in `package.json`. Update those versions and the lockfile together, review the upstream rule changes, and rerun the complete preflight before committing an upgrade. Do not weaken an error merely to re-establish a passing baseline, and do not promote a warning to blocking until its remediation is behavior-preserving.
+
+Maintainers should also read the [review-gate maintenance guide](./designdocs/OBSIDIAN_COMMUNITY_REVIEW.md) before changing review rules, severities, or fixtures.
+
+#### Fast Iteration with `npm run test:vault` (macOS)
+
+If you work across multiple worktrees or just want one command to build and load the plugin into a test vault, use `npm run test:vault`. It runs `npm install`, builds, symlinks `main.js` / `manifest.json` / `styles.css` from the worktree into the vault's `.obsidian/plugins/copilot/` folder, and reloads the plugin in Obsidian via its CLI.
+
+**One-time setup:**
+
+1. Create or pick a vault dedicated to plugin testing and open it in Obsidian at least once so `.obsidian/` is created.
+2. Enable community plugins in that vault (Settings → Community plugins → Turn on).
+3. Set an env var pointing at the vault path. Add this to `~/.zshrc`, `~/.bashrc`, or `~/.config/fish/config.fish`:
+
+   ```bash
+   export COPILOT_TEST_VAULT_PATH="$HOME/Obsidian/CopilotTestVault"
+   ```
+
+**Per change:**
+
+From any worktree, run:
+
+```bash
+npm run test:vault
+```
+
+The script installs deps, builds the plugin, symlinks the build artifacts into the vault, then calls `plugin:enable` and `plugin:reload` on the Obsidian CLI. If Obsidian isn't running, the symlinks are still in place — start Obsidian and the new build will load.
+
+Because the script symlinks files (not the worktree root), the vault's plugin `data.json` (settings, chat history) stays vault-local and is preserved across worktrees and rebuilds.
+
+Requires macOS with Obsidian installed at `/Applications/Obsidian.app`.
+
+## Commit Signing
+
+Commits to `master` must be signed and verified by GitHub. The easiest path is SSH signing using your existing SSH key.
+
+1. Configure git to sign with your SSH key:
+
+   ```bash
+   git config --global gpg.format ssh
+   git config --global user.signingkey ~/.ssh/id_ed25519.pub
+   git config --global commit.gpgsign true
+   ```
+
+   Replace `id_ed25519.pub` with the path to your own public key if different.
+
+2. Register the same key as a **Signing Key** on GitHub at https://github.com/settings/ssh/new. Set "Key type" to `Signing Key` (this is separate from an Authentication Key, even if it's the same key).
+
+3. Confirm your commit email matches a verified email on your GitHub account at https://github.com/settings/emails. Otherwise commits show as Unverified even when signed.
+
+4. Verify locally and on GitHub:
+
+   ```bash
+   git commit --allow-empty -m "test signing"
+   git log --show-signature -1
+   ```
+
+   After pushing, the commit on github.com should display a green **Verified** badge.
+
+If you already use GPG, set `gpg.format openpgp` instead and register the GPG public key at https://github.com/settings/gpg/new. Commits merged via the GitHub web UI are auto-signed by GitHub and don't need this setup.
+
+## Prompt Testing
+
+If you are making prompt changes, make sure to run the integration tests using the following steps:
+
+First creating a `.env.test` file in the root directory with your Gemini API keys
+
+```
+GEMINI_API_KEY=your_api_key_here
+```
+
+Then run the integration tests:
+
+```
+npm run test:integration
+```
+
+## Manual Testing Checklist
+
+This is a list of items to manually test after any non-trivial code change. Test the items relevant to your code change. If not sure, randomly choose items below.
+
+First, **turn on debug mode in settings**, and open the dev console.
+
+The most basic ones are model changes and mode changes.
+
+### Test Fresh Install
+
+- To ensure any **new users** can use the plugin on a **fresh install**, manually delete the `data.json` file in the plugin directory, disable the plugin in Obsidian, and re-enable it, enter the OpenAI API key and other API key(s) to see if **onboarding** is working.
+
+### Chat / Plus mode
+
+- Switch the model and check if the log has the new model key
+- Test model selection: Ask the model "what company trained you" to double check. Models from OpenAI, Claude, Gemini models can properly answer this question.
+- Test chat memory: Tell the model your name, and in a turn or two ask "what's my name" to ensure chat memory is working.
+- Use `[[note title]]` in chat and see if the model can access the content.
+
+### Vault QA / Plus mode (with a small test vault)
+
+- Use the "Refresh index" button and see if it properly starts indexing. If it says "index is up-to-date", use "Clear Copilot index" and start indexing again (or equivalently, use "force re-index" command).
+- Check if there's any error or warning during indexing in the console, and if the exclusions and inclusions are shown correctly in the notice banner. Click pause and resume.
+- After indexing is successful, ask a specific question where the answer is in your docs. For example, two of my docs are a biography of a person named "Mike", I ask "who is mike" and it should be able to answer using the two docs.
+  - In Plus mode make sure you trigger this query with `@vault` or cmd/ctrl + shift + enter. And then check "Show Sources" button for the expected docs.
+- To debug any failed QA query, we need to understand if it failed at 1. indexing 2. retrieval 3. generation.
+  - First use "list all indexed files" command to check if the docs are indexed correctly.
+  - Then check the console log for "retrieved chunks" from the hybrid retriever. Debug logs go to `console.debug`, so tick "Verbose" in the console's level filter to see them; the same lines are also in the rolling log file.
+  - If correctly retrieved, it means the Chat Model is too weak to process the context effectively. Use a stronger Chat Model
+
+### Plus mode
+
+- "Give me a recap of this week" or some other time-based query. If you have daily notes or modified notes in this period, it should be able to retrieve them.
+- Pass an image with text and ask gpt-4o-mini or gemini flash to describe the image.
+- Try some random `@` tool and see if it's working as expected.
+- Use `+` or `[[]]` to add notes to context. Ask the AI to summarize.
+- Paste a URL and ask the AI to summarize.
+
+### Settings
+
+- If you updated model logic, test adding/deleting a custom model, whether you can use a new model in chat correctly.
+- Switch the embedding model and click "refresh index" to see if it starts from scratch (it should detect that the existing index has a different type of embedding, and hence start indexing from scratch).
+- Any behaviors related to the settings that you added, updated or may have affected.
+
+### Copilot Commands
+
+- Select text in a note and apply a built-in one like "translation" or a custom one you have as Custom Prompts.
+- Any commands that you added, updated or may have affected.
+- Try the `/` custom prompt
+- Whether custom prompt templating works correctly with `{folder}`, `{#tag1, #tag2}`, etc.
+
+## Getting Help
+
+- **Discord**: [Join](https://discord.gg/bFtfKDQqZt) the server for Copilot dev discussions.
+- **Email**: logan@brevilabs.com
+
+Thank you for contributing to Copilot for Obsidian!

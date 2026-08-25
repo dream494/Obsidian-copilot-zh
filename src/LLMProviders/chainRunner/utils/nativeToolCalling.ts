@@ -1,0 +1,154 @@
+/**
+ * Native Tool Calling Utilities
+ *
+ * Utilities for extracting and handling LangChain native tool calls from AIMessage.
+ * Replaces XML-based tool calling with structured tool_calls array.
+ */
+
+import { AIMessage, ToolMessage } from "@langchain/core/messages";
+import { logError } from "@/logger";
+
+/**
+ * Standardized tool call structure extracted from AIMessage
+ */
+export interface NativeToolCall {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+}
+
+/**
+ * Accumulated tool call chunk during streaming
+ */
+export interface ToolCallChunk {
+  id?: string;
+  name: string;
+  args: string; // JSON string accumulated from chunks
+}
+
+/**
+ * Create a ToolMessage for returning tool execution results to the LLM.
+ *
+ * @param toolCallId - The ID from the original tool call
+ * @param toolName - Name of the tool that was executed
+ * @param result - String result from tool execution
+ * @returns ToolMessage to add to conversation
+ */
+export function createToolResultMessage(
+  toolCallId: string,
+  toolName: string,
+  result: string
+): ToolMessage {
+  return new ToolMessage({
+    content: result,
+    tool_call_id: toolCallId,
+    name: toolName,
+  });
+}
+
+/**
+ * Generate a unique tool call ID for cases where the LLM doesn't provide one.
+ * Format: call_<timestamp>_<random>
+ */
+export function generateToolCallId(): string {
+  const timestamp = Date.now();
+  const random = Math.random().toString(36).substring(2, 11);
+  return `call_${timestamp}_${random}`;
+}
+
+/**
+ * Raw tool call chunk as received from LangChain streaming.
+ * Different providers structure these differently:
+ * - OpenAI: { index, id, name, args }
+ * - Gemini (@langchain/google-genai): { index, id, functionCall: { name, args } }
+ */
+export interface RawToolCallChunk {
+  index?: number;
+  id?: string;
+  name?: string;
+  args?: string;
+  /** Gemini-specific: tool name is nested inside functionCall */
+  functionCall?: { name?: string; args?: Record<string, unknown> };
+}
+
+/**
+ * Accumulate a raw streaming tool call chunk into the chunk map.
+ * Handles provider differences: Gemini nests name inside `functionCall.name`
+ * while OpenAI puts it at the top level.
+ *
+ * @param toolCallChunks - Map to accumulate into (mutated in place)
+ * @param rawChunk - Raw chunk from LangChain streaming
+ */
+export function accumulateToolCallChunk(
+  toolCallChunks: Map<number, ToolCallChunk>,
+  rawChunk: RawToolCallChunk
+): void {
+  const idx = rawChunk.index ?? 0;
+  const existing = toolCallChunks.get(idx) || { name: "", args: "" };
+  if (rawChunk.id) existing.id = rawChunk.id;
+  // Gemini's @langchain/google-genai nests name inside functionCall
+  // instead of at the top level. Fall back to functionCall.name.
+  const chunkName = rawChunk.name ?? rawChunk.functionCall?.name;
+  if (chunkName) existing.name += chunkName;
+  if (rawChunk.args) existing.args += rawChunk.args;
+  toolCallChunks.set(idx, existing);
+}
+
+/**
+ * Build accumulated tool calls from streaming chunks.
+ * Call this after streaming is complete to get final tool calls.
+ *
+ * @param chunks - Map of accumulated tool call chunks (index -> chunk)
+ * @returns Array of parsed tool calls
+ */
+export function buildToolCallsFromChunks(chunks: Map<number, ToolCallChunk>): NativeToolCall[] {
+  const toolCalls: NativeToolCall[] = [];
+
+  for (const chunk of chunks.values()) {
+    // Skip incomplete chunks (no name)
+    if (!chunk.name) {
+      continue;
+    }
+
+    let args: Record<string, unknown> = {};
+    if (chunk.args) {
+      try {
+        args = JSON.parse(chunk.args);
+      } catch {
+        logError(`[ToolCall] Failed to parse args for tool "${chunk.name}": ${chunk.args}`);
+        args = {};
+      }
+    }
+
+    toolCalls.push({
+      id: chunk.id || generateToolCallId(),
+      name: chunk.name,
+      args,
+    });
+  }
+
+  return toolCalls;
+}
+
+/**
+ * Create an AIMessage with tool calls for conversation history.
+ * Used when we need to reconstruct the AIMessage after streaming.
+ *
+ * @param content - Text content of the message
+ * @param toolCalls - Tool calls to include
+ * @returns AIMessage with tool_calls
+ */
+export function createAIMessageWithToolCalls(
+  content: string,
+  toolCalls: NativeToolCall[]
+): AIMessage {
+  return new AIMessage({
+    content,
+    tool_calls: toolCalls.map((tc) => ({
+      id: tc.id,
+      name: tc.name,
+      args: tc.args,
+      type: "tool_call" as const,
+    })),
+  });
+}

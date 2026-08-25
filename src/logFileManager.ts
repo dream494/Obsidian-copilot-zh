@@ -1,0 +1,262 @@
+import { err2String } from "@/errorFormat";
+import { App, TFile } from "obsidian";
+import { ensureFolderExists } from "@/utils";
+import { getSettings } from "@/settings/model";
+import { getEffectiveCopilotFolder } from "@/settings/copilotFolder";
+import { isSensitiveKey } from "@/services/settingsSecretTransforms";
+
+type LogLevel = "INFO" | "WARN" | "ERROR";
+
+/**
+ * Manages a rolling log file that keeps the last N entries and works on desktop and mobile.
+ * - Writes to <vault>/<copilotFolder>/copilot-log.md
+ * - Maintains an in-memory ring buffer of the last 500 entries
+ * - Debounced flush to reduce I/O; single-line entries to preserve accurate line limits
+ */
+class LogFileManager {
+  private static instance: LogFileManager;
+
+  private readonly maxLines = 500;
+  private readonly maxLineChars = 8000; // guard against extremely large entries
+  private buffer: string[] = [];
+  private initialized = false;
+  private flushing = false;
+  private app: App | null = null;
+
+  static getInstance(): LogFileManager {
+    if (!LogFileManager.instance) {
+      LogFileManager.instance = new LogFileManager();
+    }
+    return LogFileManager.instance;
+  }
+
+  /**
+   * Seed the Obsidian app. The logger is a module-level singleton created before
+   * plugin load, so `app` is injected here once during onload (see main.ts)
+   * rather than read from the global.
+   */
+  setApp(app: App): void {
+    this.app = app;
+  }
+
+  getLogPath(): string {
+    // Under the configurable copilot root folder.
+    return `${getEffectiveCopilotFolder()}/copilot-log.md`;
+  }
+
+  /** Ensure the log manager is initialized. Always starts with an empty buffer. */
+  private async ensureInitialized() {
+    if (this.initialized) return;
+    // Start with empty buffer - log file is only an export artifact
+    this.initialized = true;
+  }
+
+  private sanitizeForSingleLine(value: unknown): string {
+    // Error handling: include stack traces by default as requested, collapsed to one line
+    if (value instanceof Error) {
+      const withStack = err2String(value, true);
+      return this.escapeAngleBrackets(this.collapseToSingleLine(withStack));
+    }
+
+    if (typeof value === "string") {
+      return this.escapeAngleBrackets(this.collapseToSingleLine(value));
+    }
+
+    // JSON stringify without spacing; fall back to String()
+    try {
+      const json = JSON.stringify(value);
+      return this.escapeAngleBrackets(this.collapseToSingleLine(json ?? String(value)));
+    } catch {
+      return this.escapeAngleBrackets(this.collapseToSingleLine(String(value)));
+    }
+  }
+
+  private collapseToSingleLine(s: string): string {
+    // Replace CR/LF and tabs to keep a single physical line in the log file
+    const oneLine = s.replace(/[\r\n]+/g, "\\n").replace(/\t/g, " ");
+    if (oneLine.length <= this.maxLineChars) return oneLine;
+    return (
+      oneLine.slice(0, this.maxLineChars) +
+      ` … [truncated ${oneLine.length - this.maxLineChars} chars]`
+    );
+  }
+
+  async append(level: LogLevel, ...args: unknown[]) {
+    await this.ensureInitialized();
+
+    const ts = new Date().toISOString();
+    const parts = args.map((a) => this.sanitizeForSingleLine(a));
+    const line = `${ts} ${level} ${parts.join(" ")}`.trim();
+
+    this.buffer.push(line);
+    if (this.buffer.length > this.maxLines) {
+      this.buffer.splice(0, this.buffer.length - this.maxLines);
+    }
+    // Intentionally do not flush automatically. We only write to disk when
+    // the user explicitly opens the log file.
+  }
+
+  /**
+   * Escape angle brackets to prevent Markdown/HTML rendering from interfering with the log note.
+   */
+  private escapeAngleBrackets(s: string): string {
+    return s.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  /**
+   * Append a raw Markdown block as multiple physical lines without timestamps or sanitization.
+   * Useful for structures that rely on line starts (e.g., tables, code fences).
+   */
+  async appendMarkdownBlock(lines: string[]): Promise<void> {
+    await this.ensureInitialized();
+
+    if (!Array.isArray(lines) || lines.length === 0) return;
+
+    // Add each line as-is to preserve Markdown semantics
+    for (const line of lines) {
+      const s = typeof line === "string" ? line : String(line ?? "");
+      this.buffer.push(s);
+      if (this.buffer.length > this.maxLines) {
+        this.buffer.splice(0, this.buffer.length - this.maxLines);
+      }
+    }
+    // Intentionally do not flush automatically.
+  }
+
+  async flush(): Promise<void> {
+    const app = this.app;
+    if (!app?.vault?.adapter) return;
+    if (this.flushing) return;
+    this.flushing = true;
+    try {
+      const path = this.getLogPath();
+      // Only write if a log file already exists.
+      // Do not create files or folders implicitly; creation happens in openLogFile().
+      if (await app.vault.adapter.exists(path)) {
+        const content = this.buffer.join("\n") + (this.buffer.length ? "\n" : "");
+        await app.vault.adapter.write(path, content);
+      }
+    } catch {
+      // swallow write errors; logging should never crash the app
+    } finally {
+      this.flushing = false;
+    }
+  }
+
+  async clear(): Promise<void> {
+    this.buffer = [];
+    const app = this.app;
+    if (!app?.vault?.adapter) return;
+    try {
+      const path = this.getLogPath();
+      if (await app.vault.adapter.exists(path)) {
+        // Delete the file for a clean slate; openLogFile() will recreate on demand
+        await app.vault.adapter.remove(path);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Sanitize settings by removing only API keys and license keys.
+   * Recursively handles nested objects and arrays (e.g., CustomModel.apiKey in activeModels).
+   */
+  private sanitizeSettingsForLog(): Record<string, unknown> {
+    const settings = getSettings();
+    return this.removeKeysRecursive(settings) as Record<string, unknown>;
+  }
+
+  /**
+   * Recursively clone an object/array while removing API keys and license keys.
+   */
+  private removeKeysRecursive(value: unknown): unknown {
+    if (value === null || value === undefined) {
+      return value;
+    }
+
+    // Handle arrays
+    if (Array.isArray(value)) {
+      return value.map((item) => this.removeKeysRecursive(item));
+    }
+
+    // Handle plain objects
+    if (typeof value === "object" && value.constructor === Object) {
+      const result: Record<string, unknown> = {};
+      const obj = value as Record<string, unknown>;
+
+      for (const [key, val] of Object.entries(obj)) {
+        // Skip sensitive fields (API keys, tokens, secrets, passwords, license keys)
+        // and infrastructure identifiers that may leak deployment details
+        if (
+          isSensitiveKey(key) ||
+          /orgId$/i.test(key) ||
+          /instanceName$/i.test(key) ||
+          /deploymentName$/i.test(key) ||
+          /apiVersion$/i.test(key)
+        ) {
+          continue;
+        }
+        result[key] = this.removeKeysRecursive(val);
+      }
+
+      return result;
+    }
+
+    // Return primitives as-is
+    return value;
+  }
+
+  async openLogFile(): Promise<void> {
+    const app = this.app;
+    if (!app?.vault?.adapter) return;
+    const path = this.getLogPath();
+
+    // Snapshot the current buffer
+    const bufferSnapshot = [...this.buffer];
+
+    // Append sanitized settings to the snapshot (not to the actual buffer)
+    try {
+      const sanitizedSettings = this.sanitizeSettingsForLog();
+      const settingsJson = JSON.stringify(sanitizedSettings, null, 2);
+      const settingsLines = ["", "## Settings", "```json", ...settingsJson.split("\n"), "```"];
+
+      // Add settings to the snapshot
+      bufferSnapshot.push(...settingsLines);
+    } catch {
+      // If settings export fails, continue without settings block
+    }
+
+    // Flush the snapshot to disk
+    try {
+      const content = bufferSnapshot.join("\n") + (bufferSnapshot.length ? "\n" : "");
+      const folder = path.includes("/") ? path.split("/").slice(0, -1).join("/") : "";
+      if (folder) {
+        await ensureFolderExists(app.vault, folder);
+      }
+
+      const fileExists = await app.vault.adapter.exists(path);
+      if (fileExists) {
+        await app.vault.adapter.write(path, content);
+      } else {
+        await app.vault.create(path, content);
+      }
+    } catch {
+      // Swallow write errors; logging should never crash the app
+    }
+
+    // Original buffer unchanged; open the file
+    const abstract = app.vault.getAbstractFileByPath(path);
+    const file = abstract instanceof TFile ? abstract : null;
+    try {
+      if (file) {
+        const leaf = app.workspace.getLeaf(true);
+        await leaf.openFile(file);
+      }
+    } catch {
+      // ignore
+    }
+  }
+}
+
+export const logFileManager = LogFileManager.getInstance();

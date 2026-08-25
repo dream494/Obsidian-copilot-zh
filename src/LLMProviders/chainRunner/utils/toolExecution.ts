@@ -1,0 +1,281 @@
+import { StructuredTool } from "@langchain/core/tools";
+import { logError, logInfo, logWarn } from "@/logger";
+import { checkIsPaidUser, isSelfHostModeValid } from "@/plusUtils";
+import { getSettings } from "@/settings/model";
+import { ToolManager } from "@/tools/toolManager";
+import { ToolRegistry } from "@/tools/ToolRegistry";
+import { err2String } from "@/utils";
+
+/**
+ * Represents a tool call with name and arguments.
+ * Used by native tool calling flow.
+ */
+export interface ToolCall {
+  name: string;
+  args: Record<string, unknown>;
+}
+
+interface ToolExecutionResult {
+  toolName: string;
+  result: string;
+  success: boolean;
+  /**
+   * Optional display-friendly version of the tool result for UI rendering.
+   * When absent, fallback to `result` for display purposes.
+   */
+  displayResult?: string;
+}
+
+/**
+ * Executes a single tool call with timeout and error handling
+ */
+export async function executeSequentialToolCall(
+  toolCall: ToolCall,
+  availableTools: Pick<StructuredTool, "name" | "invoke">[],
+  originalUserMessage?: string
+): Promise<ToolExecutionResult> {
+  const DEFAULT_TOOL_TIMEOUT = 120000; // 120 seconds timeout per tool
+
+  try {
+    // Validate tool call
+    if (!toolCall || !toolCall.name) {
+      return {
+        toolName: toolCall?.name || "unknown",
+        result: "Error: Invalid tool call - missing tool name",
+        success: false,
+      };
+    }
+
+    // Find the tool in the existing tool registry
+    const tool = availableTools.find((t) => t.name === toolCall.name);
+
+    if (!tool) {
+      const availableToolNames = availableTools.map((t): string => t.name).join(", ");
+      return {
+        toolName: toolCall.name,
+        result: `Error: Tool '${toolCall.name}' not found. Available tools: ${availableToolNames}. Make sure you have the tool enabled in the Agent settings.`,
+        success: false,
+      };
+    }
+
+    // Get tool metadata from registry
+    const registry = ToolRegistry.getInstance();
+    const metadata = registry.getToolMetadata(toolCall.name);
+
+    // Check if tool requires Plus subscription
+    if (metadata?.isPlusOnly) {
+      const isPaidUser = await checkIsPaidUser(undefined, { trigger: "tool_call" });
+      if (!isPaidUser && !isSelfHostModeValid()) {
+        return {
+          toolName: toolCall.name,
+          result: `Error: ${getToolDisplayName(toolCall.name)} requires a Copilot Plus subscription`,
+          success: false,
+        };
+      }
+    }
+
+    // Prepare tool arguments
+    const toolArgs = { ...toolCall.args };
+
+    // If tool requires user message content and it's provided, inject it
+    if (metadata?.requiresUserMessageContent && originalUserMessage) {
+      toolArgs._userMessageContent = originalUserMessage;
+    }
+
+    // Determine timeout for this tool
+    let timeout = DEFAULT_TOOL_TIMEOUT;
+    if (typeof metadata?.timeoutMs === "number") {
+      timeout = metadata.timeoutMs;
+    }
+
+    let result;
+    if (!timeout || timeout === Infinity) {
+      // No timeout for this tool
+      result = await ToolManager.callTool(tool, toolArgs);
+    } else {
+      // Use timeout
+      result = await Promise.race([
+        ToolManager.callTool(tool, toolArgs),
+        new Promise((_, reject) =>
+          window.setTimeout(
+            () => reject(new Error(`Tool execution timed out after ${timeout}ms`)),
+            timeout
+          )
+        ),
+      ]);
+    }
+
+    // Validate result
+    if (result === null || result === undefined) {
+      logWarn(`Tool ${toolCall.name} returned null/undefined result`);
+      // Return empty JSON object instead of plain string for better compatibility
+      return {
+        toolName: toolCall.name,
+        result: JSON.stringify({
+          message: "Tool executed but returned no result",
+          status: "empty",
+        }),
+        success: true,
+      };
+    }
+
+    return {
+      toolName: toolCall.name,
+      result: typeof result === "string" ? result : JSON.stringify(result),
+      success: true,
+    };
+  } catch (error) {
+    // Log actionable error with args for debugging schema mismatches
+    const errorMsg = err2String(error);
+    const isSchemaError = errorMsg.includes("schema");
+    if (isSchemaError) {
+      logError(
+        `[ToolCall] Schema validation failed for "${toolCall.name}". Args: ${JSON.stringify(toolCall.args, null, 2)}`
+      );
+    } else {
+      logError(`[ToolCall] Error executing "${toolCall.name}": ${errorMsg}`);
+    }
+    return {
+      toolName: toolCall.name,
+      result: `Error: ${errorMsg}`,
+      success: false,
+    };
+  }
+}
+
+/**
+ * Get display name for tool (user-friendly version)
+ */
+function getToolDisplayName(toolName: string): string {
+  // Special handling for localSearch to show the actual search type being used
+  if (toolName === "localSearch") {
+    const settings = getSettings();
+    return settings.enableSemanticSearchV3
+      ? "vault search (semantic)"
+      : "vault search (index-free)";
+  }
+
+  const displayNameMap: Record<string, string> = {
+    webSearch: "web search",
+    getFileTree: "file tree",
+    getCurrentTime: "current time",
+    getTimeRangeMs: "time range",
+    getTimeInfoByEpoch: "time info",
+    convertTimeBetweenTimezones: "timezone converter",
+    startPomodoro: "pomodoro timer",
+    pomodoroTool: "pomodoro timer",
+    youtubeTranscription: "YouTube transcription",
+    indexVault: "vault indexing",
+    indexTool: "index",
+    writeFile: "file editor",
+    editFile: "file editor",
+    obsidianDailyNote: "daily note (CLI)",
+    obsidianRandomRead: "random note (CLI)",
+    obsidianProperties: "properties (CLI)",
+    obsidianTasks: "tasks (CLI)",
+    obsidianLinks: "links (CLI)",
+    obsidianTemplates: "templates (CLI)",
+    obsidianBases: "bases (CLI)",
+  };
+
+  return displayNameMap[toolName] || toolName;
+}
+
+/**
+ * Get emoji for tool display
+ */
+function getToolEmoji(toolName: string): string {
+  const emojiMap: Record<string, string> = {
+    localSearch: "🔍",
+    webSearch: "🌐",
+    getFileTree: "📁",
+    getCurrentTime: "🕒",
+    getTimeRangeMs: "📅",
+    getTimeInfoByEpoch: "🕰️",
+    convertTimeBetweenTimezones: "🌍",
+    youtubeTranscription: "📺",
+    indexVault: "📚",
+    indexTool: "📚",
+    writeFile: "✏️",
+    editFile: "🔄",
+    readNote: "🔍",
+    obsidianDailyNote: "📅",
+    obsidianRandomRead: "🎲",
+    obsidianProperties: "🏷️",
+    obsidianTasks: "✅",
+    obsidianLinks: "🔗",
+    obsidianTemplates: "📄",
+    obsidianBases: "🗄️",
+  };
+
+  return emojiMap[toolName] || "🔧";
+}
+
+/**
+ * Log tool call details for debugging
+ */
+export function logToolCall(toolCall: ToolCall, iteration: number): void {
+  const displayName = getToolDisplayName(toolCall.name);
+  const emoji = getToolEmoji(toolCall.name);
+
+  // Create clean parameter display
+  const paramDisplay =
+    Object.keys(toolCall.args).length > 0
+      ? JSON.stringify(toolCall.args, null, 2)
+      : "(no parameters)";
+
+  logInfo(`${emoji} [Iteration ${iteration}] ${displayName.toUpperCase()}`);
+  logInfo(`Parameters:`, paramDisplay);
+  logInfo("---");
+}
+
+/**
+ * Log tool execution result
+ */
+export function logToolResult(toolName: string, result: ToolExecutionResult): void {
+  // For localSearch we already emit a structured table elsewhere; avoid redundant logs entirely
+  if (toolName === "localSearch") {
+    return;
+  }
+
+  const displayName = getToolDisplayName(toolName);
+  const emoji = getToolEmoji(toolName);
+  const status = result.success ? "✅ SUCCESS" : "❌ FAILED";
+
+  logInfo(`${emoji} ${displayName.toUpperCase()} RESULT: ${status}`);
+
+  // Default: log abbreviated result for readability (cap at 300 chars)
+  const maxLogLength = 300;
+  const text = String(result.result ?? "");
+  if (text.length > maxLogLength) {
+    logInfo(
+      `Result: ${text.substring(0, maxLogLength)}... (truncated, ${text.length} chars total)`
+    );
+  } else if (text.length > 0) {
+    logInfo(`Result:`, text);
+  }
+}
+
+/**
+ * Deduplicate sources by path, keeping highest score
+ * If path is not available, falls back to title
+ */
+export function deduplicateSources(
+  sources: { title: string; path: string; score: number; explanation?: unknown }[]
+): { title: string; path: string; score: number; explanation?: unknown }[] {
+  const uniqueSources = new Map<
+    string,
+    { title: string; path: string; score: number; explanation?: unknown }
+  >();
+
+  for (const source of sources) {
+    // Use path as the unique key, falling back to title if path is not available
+    const key = source.path || source.title;
+    const existing = uniqueSources.get(key);
+    if (!existing || source.score > existing.score) {
+      uniqueSources.set(key, source);
+    }
+  }
+
+  return Array.from(uniqueSources.values()).sort((a, b) => b.score - a.score);
+}

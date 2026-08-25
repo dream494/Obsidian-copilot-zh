@@ -1,0 +1,90 @@
+import { TFile, App } from "obsidian";
+import { logWarn } from "@/logger";
+
+/**
+ * Loads and processes note content for preview display.
+ * Handles PDF and canvas files, frontmatter stripping, and content truncation.
+ *
+ * @param app - Obsidian `App` instance used to read the file
+ * @param file - The file to load content from
+ * @param maxLength - Maximum length for truncated content (default: 500)
+ * @returns Promise resolving to processed content string
+ */
+async function loadNoteContentForPreview(
+  app: App,
+  file: TFile,
+  maxLength: number = 500
+): Promise<string> {
+  try {
+    // Handle PDF and canvas files - treat as empty content (no preview)
+    if (file.extension === "pdf" || file.extension === "canvas") {
+      return "";
+    }
+
+    const content = await app.vault.cachedRead(file);
+
+    // Strip frontmatter (YAML front matter) from the content
+    const contentWithoutFrontmatter = content.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, "").trim();
+
+    // Truncate content if necessary
+    const truncatedContent =
+      contentWithoutFrontmatter.length > maxLength
+        ? contentWithoutFrontmatter.slice(0, maxLength) + "..."
+        : contentWithoutFrontmatter;
+
+    return truncatedContent;
+  } catch (error) {
+    logWarn("Failed to read note content:", error);
+    return "内容加载失败";
+  }
+}
+
+/**
+ * Cache for storing note preview content to avoid repeated file reads
+ */
+export class NotePreviewCache {
+  private cache = new Map<string, string>();
+
+  constructor(private readonly app: App) {}
+
+  /**
+   * Gets cached content or loads it if not cached
+   * @param file - The file to get content for
+   * @param maxLength - Maximum length for truncated content
+   * @returns Promise resolving to processed content string
+   */
+  async getOrLoadContent(file: TFile, maxLength: number = 500): Promise<string> {
+    const cached = this.cache.get(file.path);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const content = await loadNoteContentForPreview(this.app, file, maxLength);
+    this.cache.set(file.path, content);
+    return content;
+  }
+
+  /**
+   * Clears the cache
+   */
+  clear(): void {
+    this.cache.clear();
+  }
+
+  /**
+   * Removes a specific file from the cache
+   * @param filePath - Path of the file to remove from cache
+   */
+  remove(filePath: string): void {
+    this.cache.delete(filePath);
+  }
+
+  /**
+   * Checks if content is cached for a file
+   * @param filePath - Path of the file to check
+   * @returns True if content is cached
+   */
+  has(filePath: string): boolean {
+    return this.cache.has(filePath);
+  }
+}

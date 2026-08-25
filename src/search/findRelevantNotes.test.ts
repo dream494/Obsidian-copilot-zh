@@ -1,0 +1,352 @@
+import { TFile } from "obsidian";
+import { getBacklinkedNotes, getLinkedNotes } from "@/noteUtils";
+import { findRelevantNotes } from "@/search/findRelevantNotes";
+import { MiyoClient } from "@/miyo/MiyoClient";
+import {
+  getMiyoFilePath,
+  getMiyoFolderName,
+  getVaultRelativeMiyoPath,
+  getSearchBackend,
+} from "@/miyo/miyoUtils";
+import { createCopilotPatternFilter } from "@/search/searchUtils";
+import { getSettings, type CopilotSettings } from "@/settings/model";
+import VectorStoreManager from "@/search/vectorStoreManager";
+
+jest.mock("@/noteUtils", () => ({
+  getLinkedNotes: jest.fn(),
+  getBacklinkedNotes: jest.fn(),
+}));
+
+jest.mock("@/settings/model", () => ({
+  getSettings: jest.fn(),
+}));
+
+jest.mock("@/search/searchUtils", () => ({
+  createCopilotPatternFilter: jest.fn(),
+}));
+
+const mockGetDocumentsByPath = jest.fn();
+const mockGetDb = jest.fn();
+
+jest.mock("@/search/vectorStoreManager", () => ({
+  __esModule: true,
+  default: {
+    getInstance: () => ({
+      getDocumentsByPath: mockGetDocumentsByPath,
+      getDb: mockGetDb,
+    }),
+  },
+}));
+
+const mockGetDocsByEmbedding = jest.fn();
+
+jest.mock("@/search/dbOperations", () => ({
+  DBOperations: {
+    getDocsByEmbedding: (...args: unknown[]) => mockGetDocsByEmbedding(...args) as unknown,
+  },
+}));
+
+const mockResolveBaseUrl = jest.fn();
+const mockSearchRelated = jest.fn();
+
+jest.mock("@/miyo/MiyoClient", () => ({
+  MiyoClient: jest.fn().mockImplementation(() => ({
+    resolveBaseUrl: (...args: unknown[]) => mockResolveBaseUrl(...args) as unknown,
+    searchRelated: (...args: unknown[]) => mockSearchRelated(...args) as unknown,
+  })),
+}));
+
+jest.mock("@/miyo/miyoUtils", () => ({
+  getMiyoFolderName: jest.fn(),
+  getMiyoFilePath: jest.fn((_: unknown, path: string) => `vault/${path}`),
+  getVaultRelativeMiyoPath: jest.fn((_: unknown, path: string) => path.replace(/^vault\//, "")),
+  getMiyoCustomUrl: jest.fn().mockReturnValue(""),
+  getSearchBackend: jest.fn(),
+}));
+
+jest.mock("@/logger", () => ({
+  logInfo: jest.fn(),
+  logWarn: jest.fn(),
+  logError: jest.fn(),
+}));
+
+/**
+ * Create a markdown file mock with Obsidian's TFile class.
+ *
+ * @param path - Vault-relative markdown path.
+ * @returns Mock TFile instance.
+ */
+function createMarkdownFile(path: string): TFile {
+  const TFileConstructor = TFile as unknown as new (filePath: string) => TFile;
+  return new TFileConstructor(path);
+}
+
+describe("findRelevantNotes", () => {
+  const mockedGetSettings = getSettings as jest.MockedFunction<typeof getSettings>;
+  const mockedGetSearchBackend = getSearchBackend as jest.MockedFunction<typeof getSearchBackend>;
+  const mockedCreateCopilotPatternFilter = createCopilotPatternFilter as jest.MockedFunction<
+    typeof createCopilotPatternFilter
+  >;
+  const mockedGetLinkedNotes = getLinkedNotes as jest.MockedFunction<typeof getLinkedNotes>;
+  const mockedGetBacklinkedNotes = getBacklinkedNotes as jest.MockedFunction<
+    typeof getBacklinkedNotes
+  >;
+  const mockedGetMiyoFolderName = getMiyoFolderName as jest.MockedFunction<
+    typeof getMiyoFolderName
+  >;
+  const mockedGetMiyoFilePath = getMiyoFilePath as jest.MockedFunction<typeof getMiyoFilePath>;
+  const mockedGetVaultRelativeMiyoPath = getVaultRelativeMiyoPath as jest.MockedFunction<
+    typeof getVaultRelativeMiyoPath
+  >;
+  const mockedVectorStoreManager = VectorStoreManager as unknown as {
+    getInstance: () => {
+      getDocumentsByPath: jest.Mock;
+      getDb: jest.Mock;
+    };
+  };
+  const mockedMiyoClient = MiyoClient as unknown as jest.Mock;
+
+  describe("findRelevantNotes()", () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+      mockedGetSearchBackend.mockReturnValue("keyword");
+      mockedCreateCopilotPatternFilter.mockReturnValue(() => true);
+      mockedGetSettings.mockReturnValue({
+        debug: false,
+        miyoServerUrl: "",
+        enableMiyo: false,
+        enableSemanticSearchV3: false,
+      } as CopilotSettings);
+      mockedGetLinkedNotes.mockReturnValue([]);
+      mockedGetBacklinkedNotes.mockReturnValue([]);
+      mockedGetMiyoFolderName.mockReturnValue("vault");
+      mockedGetMiyoFilePath.mockImplementation((_: unknown, path: string) => `vault/${path}`);
+      mockedGetVaultRelativeMiyoPath.mockImplementation((_: unknown, path: string) =>
+        path.replace(/^vault\//, "")
+      );
+
+      const source = createMarkdownFile("source.md");
+      const first = createMarkdownFile("first.md");
+      const second = createMarkdownFile("second.md");
+      const alpha = createMarkdownFile("alpha.md");
+      const beta = createMarkdownFile("beta.md");
+      const linkedOnly = createMarkdownFile("linked-only.md");
+
+      const filesByPath = new Map<string, TFile>([
+        ["source.md", source],
+        ["first.md", first],
+        ["second.md", second],
+        ["alpha.md", alpha],
+        ["beta.md", beta],
+        ["linked-only.md", linkedOnly],
+      ]);
+
+      (window.app.vault.getAbstractFileByPath as jest.Mock).mockImplementation((path: string) => {
+        return filesByPath.get(path) ?? null;
+      });
+
+      mockedVectorStoreManager
+        .getInstance()
+        .getDocumentsByPath.mockImplementation(mockGetDocumentsByPath);
+      mockedVectorStoreManager.getInstance().getDb.mockImplementation(mockGetDb);
+      mockedMiyoClient.mockImplementation(() => ({
+        resolveBaseUrl: mockResolveBaseUrl,
+        searchRelated: mockSearchRelated,
+      }));
+    });
+
+    it("uses Orama similarity scoring when source note has embeddings", async () => {
+      mockGetDocumentsByPath.mockResolvedValue([
+        {
+          id: "chunk-1",
+          path: "source.md",
+          content: "chunk one",
+          embedding: [0.1, 0.2],
+        },
+        {
+          id: "chunk-2",
+          path: "source.md",
+          content: "chunk two",
+          embedding: [0.3, 0.4],
+        },
+      ]);
+      mockGetDb.mockResolvedValue({ db: "orama" });
+      mockGetDocsByEmbedding
+        .mockResolvedValueOnce([
+          { score: 0.82, document: { path: "second.md" } },
+          { score: 0.5, document: { path: "source.md" } },
+        ])
+        .mockResolvedValueOnce([
+          { score: 0.79, document: { path: "first.md" } },
+          { score: 0.66, document: { path: "second.md" } },
+        ]);
+      mockedGetBacklinkedNotes.mockReturnValue([createMarkdownFile("second.md")]);
+      mockedGetLinkedNotes.mockReturnValue([createMarkdownFile("linked-only.md")]);
+
+      const result = await findRelevantNotes({ app: window.app, filePath: "source.md" });
+
+      expect(result.map((entry) => entry.note.path)).toEqual([
+        "second.md",
+        "first.md",
+        "linked-only.md",
+      ]);
+      expect(
+        result.find((entry) => entry.note.path === "second.md")?.metadata.similarityScore
+      ).toBe(0.82);
+      expect(mockGetDb).toHaveBeenCalledTimes(1);
+      expect(mockGetDocsByEmbedding).toHaveBeenCalledTimes(2);
+      expect(mockSearchRelated).not.toHaveBeenCalled();
+    });
+
+    it("ranks by similarity only — a backlink does not boost a lower-similarity note above a higher one", async () => {
+      mockGetDocumentsByPath.mockResolvedValue([
+        { id: "chunk-1", path: "source.md", content: "chunk one", embedding: [0.1, 0.2] },
+      ]);
+      mockGetDb.mockResolvedValue({ db: "orama" });
+      // alpha (0.6) has no links; beta (0.58) is backlinked. The old merged-score
+      // ranking boosted beta above alpha despite its lower similarity.
+      mockGetDocsByEmbedding.mockResolvedValueOnce([
+        { score: 0.6, document: { path: "alpha.md" } },
+        { score: 0.58, document: { path: "beta.md" } },
+      ]);
+      mockedGetBacklinkedNotes.mockReturnValue([createMarkdownFile("beta.md")]);
+
+      const result = await findRelevantNotes({ app: window.app, filePath: "source.md" });
+
+      expect(result.map((entry) => entry.note.path)).toEqual(["alpha.md", "beta.md"]);
+      expect(result[0].metadata.similarityScore).toBe(0.6);
+      expect(result.find((entry) => entry.note.path === "beta.md")?.metadata.hasBacklinks).toBe(
+        true
+      );
+    });
+
+    it("uses Miyo when shouldUseMiyoForRelevantNotes is true (enableMiyo=true and valid self-host)", async () => {
+      mockedGetSearchBackend.mockReturnValue("miyo");
+      mockedGetSettings.mockReturnValue({
+        debug: false,
+        miyoServerUrl: "http://127.0.0.1:8742",
+        enableMiyo: true,
+        enableSemanticSearchV3: true,
+      } as CopilotSettings);
+      mockGetDocumentsByPath.mockResolvedValue([
+        {
+          id: "chunk-a",
+          path: "source.md",
+          content: "source chunk A",
+          embedding: [],
+        },
+        {
+          id: "chunk-b",
+          path: "source.md",
+          content: "source chunk B",
+          embedding: [],
+        },
+      ]);
+      mockResolveBaseUrl.mockResolvedValue("http://127.0.0.1:8742");
+      mockSearchRelated.mockResolvedValue({
+        results: [
+          { id: "self", path: "vault/source.md", score: 0.99, chunk_text: "self" },
+          { id: "a-1", path: "vault/alpha.md", score: 0.45, chunk_text: "alpha1" },
+          { id: "b-1", path: "vault/beta.md", score: 0.88, chunk_text: "beta" },
+          { id: "a-2", path: "vault/alpha.md", score: 0.6, chunk_text: "alpha2" },
+        ],
+      });
+
+      const result = await findRelevantNotes({ app: window.app, filePath: "source.md" });
+
+      expect(result.map((entry) => entry.note.path)).toEqual(["beta.md", "alpha.md"]);
+      expect(result.find((entry) => entry.note.path === "alpha.md")?.metadata.similarityScore).toBe(
+        0.6
+      );
+      expect(mockGetDb).not.toHaveBeenCalled();
+      expect(mockGetDocumentsByPath).not.toHaveBeenCalled();
+      expect(mockSearchRelated).toHaveBeenCalledTimes(1);
+      expect(mockSearchRelated).toHaveBeenCalledWith("http://127.0.0.1:8742", "vault/source.md", {
+        folderName: "vault",
+        limit: 20,
+      });
+    });
+
+    it("applies the live Copilot scope to semantic and linked candidates", async () => {
+      mockedGetSearchBackend.mockReturnValue("miyo");
+      mockResolveBaseUrl.mockResolvedValue("http://127.0.0.1:8742");
+      mockSearchRelated.mockResolvedValue({
+        results: [
+          { id: "allowed", path: "vault/beta.md", score: 0.8 },
+          { id: "excluded", path: "vault/alpha.md", score: 0.9 },
+        ],
+      });
+      mockedGetLinkedNotes.mockReturnValue([createMarkdownFile("linked-only.md")]);
+      const isAllowed = jest.fn((path: string) => path === "beta.md");
+      mockedCreateCopilotPatternFilter.mockReturnValue(isAllowed);
+
+      const result = await findRelevantNotes({ app: window.app, filePath: "source.md" });
+
+      expect(result.map((entry) => entry.note.path)).toEqual(["beta.md"]);
+      expect(mockedCreateCopilotPatternFilter).toHaveBeenCalledWith(window.app);
+      expect(isAllowed.mock.calls.map(([path]) => path)).toEqual([
+        "beta.md",
+        "alpha.md",
+        "linked-only.md",
+      ]);
+    });
+
+    it("falls back to Miyo when Orama docs exist but have no embeddings and have content", async () => {
+      // enableMiyo=false ensures shouldUseMiyoForRelevantNotes() returns false,
+      // so the no-embeddings fallback path (line 212 of findRelevantNotes.ts) is exercised.
+      mockedGetSettings.mockReturnValue({
+        debug: false,
+        miyoServerUrl: "http://127.0.0.1:8742",
+        enableMiyo: false,
+        enableSemanticSearchV3: true,
+      } as CopilotSettings);
+      mockGetDocumentsByPath.mockResolvedValue([
+        { id: "chunk-a", path: "source.md", content: "source chunk content", embedding: [] },
+      ]);
+      mockResolveBaseUrl.mockResolvedValue("http://127.0.0.1:8742");
+      mockSearchRelated.mockResolvedValue({
+        results: [
+          { id: "a-1", path: "vault/alpha.md", score: 0.75, chunk_text: "alpha chunk" },
+          { id: "self", path: "vault/source.md", score: 0.99, chunk_text: "self" },
+        ],
+      });
+
+      const result = await findRelevantNotes({ app: window.app, filePath: "source.md" });
+
+      expect(result.map((e) => e.note.path)).toEqual(["alpha.md"]);
+      expect(result[0].metadata.similarityScore).toBe(0.75);
+      // Orama path not taken (no embeddings); Miyo called as fallback
+      expect(mockGetDocsByEmbedding).not.toHaveBeenCalled();
+      expect(mockSearchRelated).toHaveBeenCalledTimes(1);
+    });
+
+    it("falls back to link-only relevance when Miyo related-note search fails", async () => {
+      mockedGetSearchBackend.mockReturnValue("miyo");
+      mockedGetSettings.mockReturnValue({
+        debug: false,
+        miyoServerUrl: "http://127.0.0.1:8742",
+        enableMiyo: true,
+        enableSemanticSearchV3: true,
+      } as CopilotSettings);
+      mockGetDocumentsByPath.mockResolvedValue([
+        {
+          id: "chunk-a",
+          path: "source.md",
+          content: "source chunk A",
+          embedding: [],
+        },
+      ]);
+      mockResolveBaseUrl.mockResolvedValue("http://127.0.0.1:8742");
+      mockSearchRelated.mockRejectedValue(new Error("Miyo unavailable"));
+      mockedGetLinkedNotes.mockReturnValue([createMarkdownFile("linked-only.md")]);
+
+      const result = await findRelevantNotes({ app: window.app, filePath: "source.md" });
+
+      expect(result).toHaveLength(1);
+      expect(result[0].note.path).toBe("linked-only.md");
+      expect(result[0].metadata.similarityScore).toBeUndefined();
+      expect(result[0].metadata.hasOutgoingLinks).toBe(true);
+      expect(mockGetDocumentsByPath).not.toHaveBeenCalled();
+    });
+  });
+});

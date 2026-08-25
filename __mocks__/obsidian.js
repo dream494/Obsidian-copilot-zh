@@ -1,0 +1,173 @@
+// __mocks__/obsidian.js
+import { parse as parseYamlString } from "yaml";
+
+// Per-test overrides set via the exported `__setRequestUrlImpl` helper.
+// Default: empty success response. Tests that exercise network paths should
+// install their own implementation.
+let requestUrlImpl = jest.fn().mockResolvedValue({
+  status: 200,
+  text: "",
+  json: undefined,
+  arrayBuffer: new ArrayBuffer(0),
+  headers: {},
+});
+
+module.exports = {
+  moment: jest.requireActual("moment"),
+  requestUrl: (...args) => requestUrlImpl(...args),
+  __setRequestUrlImpl: (impl) => {
+    requestUrlImpl = impl;
+  },
+  Vault: jest.fn().mockImplementation(() => {
+    return {
+      getMarkdownFiles: jest.fn().mockImplementation(() => {
+        // Return an array of mock markdown file objects
+        return [
+          { path: "test/test2/note1.md" },
+          { path: "test/note2.md" },
+          { path: "test2/note3.md" },
+          { path: "note4.md" },
+        ];
+      }),
+      cachedRead: jest.fn().mockImplementation((file) => {
+        // Simulate reading file contents. You can adjust the content as needed for your tests.
+        const fileContents = {
+          "test/test2/note1.md": "---\ntags: [Tag1, tag2]\n---\nContent of note1",
+          "test/note2.md": "---\ntags: [tag2, tag3]\n---\nContent of note2",
+          "test2/note3.md": "something else ---\ntags: [false_tag]\n---\nContent of note3",
+          "note4.md": "---\ntags: [tag1, Tag4]\n---\nContent of note4",
+        };
+        return Promise.resolve(fileContents[file.path]);
+      }),
+    };
+  }),
+  Platform: {
+    isDesktop: true,
+    isDesktopApp: true,
+    isMobile: false,
+    // Filesystem case sensitivity is behaviour some code branches on; default to
+    // the case-sensitive branch so a test must opt in to folding explicitly.
+    isWin: false,
+    isMacOS: false,
+    isIosApp: false,
+  },
+  FileSystemAdapter: class FileSystemAdapter {
+    constructor(basePath = "/vault") {
+      this._basePath = basePath;
+      this.read = jest.fn();
+      this.write = jest.fn();
+      this.exists = jest.fn().mockResolvedValue(true);
+      this.mkdir = jest.fn().mockResolvedValue(undefined);
+      this.list = jest.fn().mockResolvedValue({ files: [], folders: [] });
+      this.remove = jest.fn().mockResolvedValue(undefined);
+    }
+    getBasePath() {
+      return this._basePath;
+    }
+    getFullPath(p) {
+      const rel = String(p).replace(/\\/g, "/").replace(/^\/+/, "");
+      return rel ? `${this._basePath}/${rel}` : this._basePath;
+    }
+  },
+  normalizePath: (p) => String(p).replace(/\\\\/g, "/").replace(/\/+/g, "/"),
+  parseYaml: jest.fn().mockImplementation((content) => {
+    return parseYamlString(content);
+  }),
+  Modal: class Modal {
+    constructor(app) {
+      this.app = app;
+      // Mirrors the element tree Obsidian's own Modal builds in its constructor,
+      // in the same nesting order, so subclasses that reach for `modalEl` or
+      // walk up from `contentEl` behave here as they do at runtime.
+      const doc = window.document;
+      this.containerEl = doc.createElement("div");
+      this.containerEl.className = "modal-container";
+      this.modalEl = this.containerEl.appendChild(doc.createElement("div"));
+      this.modalEl.className = "modal";
+      this.headerEl = this.modalEl.appendChild(doc.createElement("div"));
+      this.headerEl.className = "modal-header";
+      this.titleEl = this.headerEl.appendChild(doc.createElement("div"));
+      this.titleEl.className = "modal-title";
+      this.contentEl = this.modalEl.appendChild(doc.createElement("div"));
+      this.contentEl.className = "modal-content";
+      this.open = jest.fn();
+      this.close = jest.fn();
+      this.onOpen = jest.fn();
+      this.onClose = jest.fn();
+    }
+  },
+  // Base class for FolderSearchModal & friends; subclasses only need it to be
+  // constructable so suites that pull them into the module graph can load.
+  FuzzySuggestModal: class FuzzySuggestModal {
+    constructor(app) {
+      this.app = app;
+      this.open = jest.fn();
+      this.close = jest.fn();
+      this.setPlaceholder = jest.fn();
+    }
+  },
+  App: jest.fn().mockImplementation(() => ({
+    workspace: {
+      getActiveFile: jest.fn(),
+    },
+    vault: {
+      read: jest.fn(),
+    },
+  })),
+  ItemView: jest.fn().mockImplementation(function () {
+    this.containerEl = window.document.createElement("div");
+    this.onOpen = jest.fn();
+    this.onClose = jest.fn();
+    this.getDisplayText = jest.fn().mockReturnValue("Mock View");
+    this.getViewType = jest.fn().mockReturnValue("mock-view");
+    this.getIcon = jest.fn().mockReturnValue("document");
+  }),
+  Notice: jest.fn().mockImplementation(function (message) {
+    this.message = message;
+    this.noticeEl = window.document.createElement("div");
+    this.hide = jest.fn();
+  }),
+  TFile: jest.fn().mockImplementation(function (path) {
+    this.path = path;
+    this.name = path.split("/").pop();
+    this.basename = this.name.replace(/\.[^/.]+$/, "");
+    this.extension = path.split(".").pop();
+  }),
+  TFolder: jest.fn().mockImplementation(function (path) {
+    this.path = path || "";
+    this.name = this.path.split("/").pop() || "";
+  }),
+  WorkspaceLeaf: jest.fn().mockImplementation(function () {
+    this.view = null;
+    this.setViewState = jest.fn();
+    this.detach = jest.fn();
+    this.getViewState = jest.fn().mockReturnValue({});
+  }),
+};
+
+// Mock the global app object
+window.app = {
+  vault: {
+    getAbstractFileByPath: jest.fn().mockReturnValue({
+      name: "test-file.md",
+      path: "test-file.md",
+    }),
+    read: jest.fn().mockResolvedValue("test content"),
+    modify: jest.fn().mockResolvedValue(undefined),
+    getMarkdownFiles: jest.fn().mockReturnValue([]),
+    getAllLoadedFiles: jest.fn().mockReturnValue([]),
+  },
+  workspace: {
+    getActiveFile: jest.fn().mockReturnValue(null),
+    getLeaf: jest.fn().mockReturnValue({
+      openFile: jest.fn().mockResolvedValue(undefined),
+    }),
+  },
+  metadataCache: {
+    getFirstLinkpathDest: jest.fn().mockReturnValue(null),
+    getFileCache: jest.fn().mockReturnValue(null),
+  },
+  fileManager: {
+    trashFile: jest.fn().mockResolvedValue(undefined),
+  },
+};

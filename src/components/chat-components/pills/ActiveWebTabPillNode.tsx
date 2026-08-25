@@ -1,0 +1,192 @@
+import React from "react";
+import {
+  DOMConversionMap,
+  DOMConversionOutput,
+  DOMExportOutput,
+  LexicalEditor,
+  LexicalNode,
+  NodeKey,
+  $getRoot,
+} from "lexical";
+import { Globe } from "lucide-react";
+import { isDesktopRuntime } from "@/utils/desktopRuntime";
+import { ACTIVE_WEB_TAB_MARKER } from "@/constants";
+import { BasePillNode, getEditorDocument, SerializedBasePillNode } from "./BasePillNode";
+import { TruncatedPillText } from "./TruncatedPillText";
+import { PillBadge } from "./PillBadge";
+import { useActiveWebTabState } from "@/components/chat-components/hooks/useActiveWebTabState";
+
+export type SerializedActiveWebTabPillNode = SerializedBasePillNode;
+
+/**
+ * ActiveWebTabPillNode represents the "Current Web Tab" in context.
+ * It automatically displays whatever web tab is currently active in Obsidian Web Viewer.
+ * Desktop-only feature.
+ */
+export class ActiveWebTabPillNode extends BasePillNode {
+  static getType(): string {
+    return "active-web-tab-pill";
+  }
+
+  static clone(node: ActiveWebTabPillNode): ActiveWebTabPillNode {
+    return new ActiveWebTabPillNode(node.__key);
+  }
+
+  constructor(key?: NodeKey) {
+    super("Current Web Tab", key);
+  }
+
+  getClassName(): string {
+    return "active-web-tab-pill-wrapper";
+  }
+
+  getDataAttribute(): string {
+    return "data-lexical-active-web-tab-pill";
+  }
+
+  static importDOM(): DOMConversionMap | null {
+    return {
+      span: (node: HTMLElement) => {
+        if (node.hasAttribute("data-lexical-active-web-tab-pill")) {
+          return {
+            conversion: convertActiveWebTabPillElement,
+            priority: 2,
+          };
+        }
+        return null;
+      },
+    };
+  }
+
+  static importJSON(_serializedNode: SerializedActiveWebTabPillNode): ActiveWebTabPillNode {
+    return $createActiveWebTabPillNode();
+  }
+
+  exportJSON(): SerializedActiveWebTabPillNode {
+    return {
+      ...super.exportJSON(),
+      type: "active-web-tab-pill",
+      version: 1,
+    };
+  }
+
+  exportDOM(editor: LexicalEditor): DOMExportOutput {
+    const element = getEditorDocument(editor).win.createSpan({
+      text: ACTIVE_WEB_TAB_MARKER,
+      attr: { "data-lexical-active-web-tab-pill": "true" },
+    });
+    return { element };
+  }
+
+  getTextContent(): string {
+    return ACTIVE_WEB_TAB_MARKER;
+  }
+
+  decorate(): JSX.Element {
+    return <ActiveWebTabPillComponent />;
+  }
+}
+
+function convertActiveWebTabPillElement(_domNode: HTMLElement): DOMConversionOutput | null {
+  const node = $createActiveWebTabPillNode();
+  return { node };
+}
+
+/**
+ * Component that renders the active web tab pill.
+ * Uses activeWebTabForMentions to match the actual send behavior:
+ * - Has value when web tab is active OR when switched directly to chat panel
+ * - Null when switched to other views (e.g., note tab)
+ * This ensures UI display matches what will actually be sent.
+ */
+function ActiveWebTabPillComponent(): JSX.Element {
+  // Use activeWebTabForMentions to match send behavior (not activeOrLastWebTab)
+  const { activeWebTabForMentions } = useActiveWebTabState();
+
+  // Not supported on mobile
+  if (!isDesktopRuntime()) {
+    return (
+      <PillBadge>
+        <div className="tw-flex tw-items-center tw-gap-1">
+          <Globe className="tw-size-3" />
+          <TruncatedPillText
+            content="当前网页标签页"
+            openBracket="{"
+            closeBracket="}"
+            tooltipContent={<div className="tw-text-left">移动端不支持 Web Viewer</div>}
+          />
+        </div>
+      </PillBadge>
+    );
+  }
+
+  // No active web tab (matches Active Note pill behavior when no active note)
+  if (!activeWebTabForMentions) {
+    return (
+      <PillBadge>
+        <div className="tw-flex tw-items-center tw-gap-1">
+          <Globe className="tw-size-3" />
+          <TruncatedPillText
+            content="当前网页标签页"
+            openBracket="{"
+            closeBracket="}"
+            tooltipContent={
+              <div className="tw-text-left">
+                发送消息时将使用当时的当前网页标签页
+              </div>
+            }
+          />
+        </div>
+      </PillBadge>
+    );
+  }
+
+  // Active web tab exists
+  return (
+    <PillBadge>
+      <div className="tw-flex tw-items-center tw-gap-1">
+        <Globe className="tw-size-3" />
+        <span className="tw-max-w-40 tw-truncate" title={activeWebTabForMentions.url}>
+          {activeWebTabForMentions.title ?? "无标题"}
+        </span>
+        <span className="tw-text-xs tw-text-faint">当前</span>
+      </div>
+    </PillBadge>
+  );
+}
+
+/** Create an ActiveWebTabPillNode. */
+export function $createActiveWebTabPillNode(): ActiveWebTabPillNode {
+  return new ActiveWebTabPillNode();
+}
+
+/** Check if a node is an ActiveWebTabPillNode. */
+export function $isActiveWebTabPillNode(
+  node: LexicalNode | null | undefined
+): node is ActiveWebTabPillNode {
+  return node instanceof ActiveWebTabPillNode;
+}
+
+/**
+ * Removes all active web tab pills from the editor.
+ * @returns The number of pills removed
+ */
+export function $removeActiveWebTabPills(): number {
+  const root = $getRoot();
+  let removedCount = 0;
+
+  function traverse(node: LexicalNode): void {
+    if ($isActiveWebTabPillNode(node)) {
+      node.remove();
+      removedCount++;
+    } else if ("getChildren" in node && typeof node.getChildren === "function") {
+      const children = (node as { getChildren: () => LexicalNode[] }).getChildren();
+      for (const child of children) {
+        traverse(child);
+      }
+    }
+  }
+
+  traverse(root);
+  return removedCount;
+}
